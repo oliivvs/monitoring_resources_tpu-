@@ -1,0 +1,21 @@
+# Только собственные/разрешённые ресурсы. Локальный тестовый сервер поднимается отдельно.
+resources:
+  - id: web-local
+    name: Локальный HTTP-сервер
+    target: http://127.0.0.1:18080/health
+    check_type: HTTP
+    interval_seconds: 60
+    timeout_seconds: 5
+    expected_http_codes:
+      - start: 200
+        end: 299
+    active: true
+  - id: tcp-local
+    name: Локальный TCP-сервер
+    target: 127.0.0.1
+    check_type: TCP
+    port: 18081
+    interval_seconds: 60
+    timeout_seconds: 5
+    expected_http_codes: []
+    active: false
