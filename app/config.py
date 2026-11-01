@@ -12,6 +12,9 @@ class AppSettings(BaseSettings):
         extra="ignore",
     )
 
+    # База данных, общая для FastAPI и Alembic
+    database_url: str = "sqlite:///monitoring.db"
+
     app_name: str = "Мониторинг ресурсов ТПУ"
     app_host: str = "127.0.0.1"
     app_port: int = Field(default=8000, ge=1, le=65535)
