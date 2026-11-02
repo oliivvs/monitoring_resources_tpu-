@@ -6,7 +6,7 @@ from pydantic import BaseModel
 
 from app.config import AppSettings
 
-
+from app.routes.resources import router as resources_router
 # Настройки приложения
 settings = AppSettings()
 
@@ -32,3 +32,5 @@ app = FastAPI(
 )
 def health() -> HealthResponse:
     return HealthResponse(status="ok")
+# Подключаем API просмотра ресурсов
+app.include_router(resources_router)
