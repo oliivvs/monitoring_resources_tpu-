@@ -1,5 +1,5 @@
 
-from pydantic import Field
+from pydantic import AnyHttpUrl, Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -21,4 +21,17 @@ class AppSettings(BaseSettings):
     app_log_level: str = Field(
         default="info",
         pattern=r"^(debug|info|warning|error|critical)$"
+    )
+
+    # Настройки отправки событий во внешний API
+    event_post_url: AnyHttpUrl | None = None
+
+    # Токен для авторизации запросов
+    event_token: SecretStr | None = None
+
+    # Максимальное время ожидания ответа
+    event_timeout_seconds: float = Field(
+        default=5.0,
+        gt=0,
+        le=60,
     )
