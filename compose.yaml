@@ -1,0 +1,115 @@
+
+# Совместный запуск мониторинга ТПУ
+
+x-db-service: &db-service
+  build: .
+  image: tpu-monitoring:a08
+  environment:
+    MONITORING_DATABASE_URL: sqlite:////data/monitoring.db
+  volumes:
+    - monitoring-data:/data
+
+services:
+  # Применяем миграции перед запуском системы
+  migrate:
+    <<: *db-service
+    command:
+      - python
+      - -m
+      - alembic
+      - upgrade
+      - head
+    restart: "no"
+
+  # Основной REST API
+  api:
+    <<: *db-service
+    command:
+      - python
+      - -m
+      - uvicorn
+      - app.main:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+    ports:
+      - "127.0.0.1:18080:8000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Mock API для приёма событий
+  mock-api:
+    build: .
+    image: tpu-monitoring:a08
+    command:
+      - python
+      - -m
+      - uvicorn
+      - mock_api.main:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8001"
+    environment:
+      MONITORING_EVENT_TOKEN: ${MONITORING_EVENT_TOKEN:?Set MONITORING_EVENT_TOKEN in .env}
+    ports:
+      - "127.0.0.1:18081:8001"
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/health', timeout=3)"
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Отправитель событий Outbox
+  sender:
+    <<: *db-service
+    command:
+      - python
+      - -m
+      - scripts.run_sender
+    environment:
+      MONITORING_DATABASE_URL: sqlite:////data/monitoring.db
+      MONITORING_EVENT_POST_URL: http://mock-api:8001/api/v1/status/events
+      MONITORING_EVENT_TOKEN: ${MONITORING_EVENT_TOKEN:?Set MONITORING_EVENT_TOKEN in .env}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      mock-api:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Планировщик проверок HTTP/TCP
+  scheduler:
+    <<: *db-service
+    command:
+      - python
+      - -m
+      - scripts.run_scheduler
+    environment:
+      MONITORING_DATABASE_URL: sqlite:////data/monitoring.db
+      MONITORING_ALLOWED_HOSTS: ${MONITORING_ALLOWED_HOSTS:-}
+      MONITORING_ALLOWED_PORTS: ${MONITORING_ALLOWED_PORTS:-}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+volumes:
+  monitoring-data:
