@@ -1,0 +1,22 @@
+
+# Тестовая конфигурация Entity API ТПУ
+
+source_system: tpu-entity-mock
+source_entity: servers
+resource_id_prefix: tpu-servers-
+
+# Соответствие внутренних и внешних полей
+fields:
+  source_record_id: source_record_id
+  name: name
+  target: target
+  check_type: check_type
+  active: active
+
+# Стандартные настройки мониторинга
+defaults:
+  interval_seconds: 60
+  timeout_seconds: 5.0
+  up_after: 2
+  down_after: 3
+  heartbeat_interval_seconds: 75
