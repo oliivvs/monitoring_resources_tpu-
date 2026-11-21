@@ -26,6 +26,8 @@ def create_snapshot_app(
     *,
     token: str | None = None,
     record_id: str | None = None,
+    source_sequence: int = 2,
+    interval_seconds: int = 120,
 ) -> FastAPI:
     configured_token = (
         token
@@ -44,6 +46,12 @@ def create_snapshot_app(
 
     if not RECORD_ID_PATTERN.fullmatch(configured_record_id):
         raise ValueError("Некорректный тестовый record_id")
+
+    if type(source_sequence) is not int or source_sequence < 0:
+        raise ValueError("Некорректный source_sequence")
+
+    if type(interval_seconds) is not int or interval_seconds < 1:
+        raise ValueError("Некорректный interval_seconds")
 
     application = FastAPI(
         title="Oracle Sync - Lab Entity API",
@@ -101,13 +109,13 @@ def create_snapshot_app(
             "items": [
                 {
                     "source_record_id": configured_record_id,
-                    "source_sequence": 2,
+                    "source_sequence": source_sequence,
                     "name": "Обновлённый сервер Docker",
                     "target": "https://1.1.1.1/health",
                     "check_type": "HTTP",
                     "active": True,
                     "port": None,
-                    "interval_seconds": 120,
+                    "interval_seconds": interval_seconds,
                     "timeout_seconds": 5.0,
                     "expected_http_codes": [
                         {"start": 200, "end": 299}
@@ -123,4 +131,13 @@ def create_snapshot_app(
     return application
 
 
-app = create_snapshot_app()
+app = create_snapshot_app(
+    source_sequence=int(
+        os.environ.get("ORACLE_LAB_SNAPSHOT_SEQUENCE", "2")
+    ),
+    interval_seconds=int(
+        os.environ.get(
+            "ORACLE_LAB_SNAPSHOT_INTERVAL_SECONDS", "120"
+        )
+    ),
+)

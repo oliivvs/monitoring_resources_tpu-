@@ -103,3 +103,26 @@ def test_disabled_without_token():
         )
 
     assert response.status_code == 503
+
+
+def test_configurable_snapshot_version():
+    with TestClient(
+        create_snapshot_app(
+            token=TOKEN,
+            record_id=RECORD_ID,
+            source_sequence=3,
+            interval_seconds=180,
+        )
+    ) as client:
+        response = client.get(
+            PATH,
+            params={"source_record_id": RECORD_ID},
+            headers={
+                "Authorization": f"Bearer {TOKEN}"
+            },
+        )
+
+    assert response.status_code == 200
+    record = response.json()["items"][0]
+    assert record["source_sequence"] == 3
+    assert record["interval_seconds"] == 180

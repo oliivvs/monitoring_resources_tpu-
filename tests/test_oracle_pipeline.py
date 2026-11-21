@@ -930,3 +930,95 @@ async def test_delete_skips_snapshot_fetch(environment):
     assert result.disposition == "PROCESSED"
     assert resource_state(engine)["active"] == 0
     assert len(requests) == 0
+
+
+@pytest.mark.asyncio
+async def test_partial_update_recovers_after_entity_api_outage(
+    environment,
+):
+    """Временный сбой API -> RETRY -> успешное обновление."""
+
+    from datetime import timedelta
+
+    engine, client, original_bridge = environment
+
+    # Создаём исходный ресурс.
+    send(client, 10)
+    result = await process(engine, original_bridge)
+
+    assert result.disposition == "PROCESSED"
+    assert resource_state(engine)["version_number"] == 1
+
+    # Отправляем частичный UPDATE.
+    event_id = send(
+        client,
+        11,
+        operation=3,
+        data={"name": "Восстановленный сервер"},
+    )
+
+    # Первая попытка: Entity API недоступен (HTTP 503).
+    broken_bridge, broken_client, _ = make_snapshot_handler(
+        original_bridge,
+        status_code=503,
+    )
+
+    first_now = datetime.now(timezone.utc) + timedelta(
+        seconds=1
+    )
+
+    async with broken_client:
+        first = await process(
+            engine,
+            broken_bridge,
+            now=first_now,
+            retry_base_seconds=5,
+        )
+
+    assert first.disposition == "RETRY"
+
+    saved = event_status(engine, event_id)
+
+    assert saved["processing_status"] == "PENDING"
+    assert saved["attempts"] == 1
+    assert saved["last_error"] == "EntityApiHttpError"
+
+    # Неудачный запрос не изменил конфигурацию.
+    assert resource_state(engine)["version_number"] == 1
+    assert resource_state(engine)["interval_seconds"] == 60
+    assert last_sequence(engine) == 10
+
+    # Вторая попытка: API восстановился.
+    recovered_bridge, recovered_client, requests = (
+        make_snapshot_handler(
+            original_bridge,
+            make_snapshot_record(
+                name="Восстановленный сервер",
+                interval_seconds=180,
+            ),
+        )
+    )
+
+    async with recovered_client:
+        second = await process(
+            engine,
+            recovered_bridge,
+            now=first_now + timedelta(seconds=10),
+            retry_base_seconds=5,
+        )
+
+    assert second.disposition == "PROCESSED"
+
+    saved = event_status(engine, event_id)
+    resource = resource_state(engine)
+
+    assert saved["processing_status"] == "PROCESSED"
+    assert saved["attempts"] == 2
+    assert saved["last_error"] is None
+
+    assert resource["name"] == "Восстановленный сервер"
+    assert resource["version_number"] == 2
+    assert resource["interval_seconds"] == 180
+    assert last_sequence(engine) == 11
+
+    assert len(requests) == 1
