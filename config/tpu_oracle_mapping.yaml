@@ -1,0 +1,21 @@
+
+# Тестовое сопоставление Oracle Sync -> ресурс мониторинга.
+# Production-поля необходимо согласовать с ТПУ.
+
+source_system: tpu-oracle-sync
+source_entity: servers
+resource_id_prefix: tpu-oracle-
+
+fields:
+  source_record_id: source_record_id
+  name: name
+  target: target
+  check_type: check_type
+  active: active
+  port: port
+  interval_seconds: interval_seconds
+  timeout_seconds: timeout_seconds
+  expected_http_codes: expected_http_codes
+  up_after: up_after
+  down_after: down_after
+  heartbeat_interval_seconds: heartbeat_interval_seconds

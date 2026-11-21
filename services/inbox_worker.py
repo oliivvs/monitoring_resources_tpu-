@@ -1,18 +1,23 @@
 
-"""A21: надёжное извлечение событий Oracle Sync из SQLite Inbox.
+"""A21/A22: надёжная обработка событий Oracle Sync Inbox.
 
-Этот модуль пока не изменяет ресурсы. Реальный обработчик
-INSERT/UPDATE/DELETE подключим в A22.
+Синхронный режим предназначен для обработчиков SQLite.
 
-Обработчик должен выполнять только операции SQLite через
-переданную Connection, без HTTP, DNS и самостоятельного commit.
+Асинхронный режим разделяет обработку на этапы:
+1. Захват события.
+2. Подготовка и сетевая проверка БЕЗ транзакции.
+3. Атомарное применение к SQLite и отметка PROCESSED.
+
+Нельзя выполнять HTTP, DNS или commit внутри обработчика SQLite.
 """
 
 from __future__ import annotations
 
+import asyncio
+
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Callable, Literal
+from typing import Any, Awaitable, Callable, Literal
 from uuid import uuid4
 
 from sqlalchemy import text
@@ -45,10 +50,21 @@ class ProcessResult:
 
 InboxHandler = Callable[[Connection, InboxClaim], None]
 
+InboxPreparer = Callable[
+    [InboxClaim],
+    Awaitable[Any],
+]
+
+InboxPreparedHandler = Callable[
+    [Connection, InboxClaim, Any],
+    None,
+]
+
 
 def _clock(now: datetime | None) -> datetime:
     value = (
-        now if now is not None
+        now
+        if now is not None
         else datetime.now(timezone.utc)
     )
 
@@ -82,6 +98,16 @@ def _limits(
         )
 
 
+def _retry_limit(retry_base_seconds: int) -> None:
+    if (
+        type(retry_base_seconds) is not int
+        or not 1 <= retry_base_seconds <= 3600
+    ):
+        raise ValueError(
+            "retry_base_seconds должен быть от 1 до 3600"
+        )
+
+
 def claim_inbox_event(
     engine: Engine,
     *,
@@ -89,11 +115,7 @@ def claim_inbox_event(
     lease_seconds: int = 60,
     max_attempts: int = 5,
 ) -> InboxClaim | None:
-    """Атомарно захватывает готовое событие.
-
-    BEGIN IMMEDIATE сериализует операции SQLite.
-    Истёкший захват может получить другой Worker.
-    """
+    """Атомарно захватывает готовое событие."""
 
     _limits(
         lease_seconds=lease_seconds,
@@ -109,7 +131,6 @@ def claim_inbox_event(
     )
 
     with write_transaction(engine) as conn:
-        # Истёкшие события с исчерпанными попытками.
         conn.execute(
             text("""
                 UPDATE inbox_events
@@ -197,6 +218,149 @@ def claim_inbox_event(
     )
 
 
+def _apply_claim(
+    engine: Engine,
+    claim: InboxClaim,
+    handler: InboxHandler,
+    *,
+    now: datetime | None = None,
+    check_lease: bool = False,
+) -> ProcessResult:
+    """Атомарно применяет событие и помечает PROCESSED."""
+
+    with write_transaction(engine) as conn:
+        timestamp = _clock(now)
+        params = {
+            "id": claim.event_id,
+            "token": claim.claim_token,
+            "at": to_utc_iso(timestamp),
+        }
+
+        lease_condition = (
+            "AND lease_expires_at > :at"
+            if check_lease
+            else ""
+        )
+
+        owned = conn.execute(
+            text(f"""
+                SELECT 1
+                FROM inbox_events
+                WHERE event_id=:id
+                  AND claim_token=:token
+                  AND processing_status='PROCESSING'
+                  {lease_condition}
+            """),
+            params,
+        ).scalar_one_or_none()
+
+        if owned is None:
+            return ProcessResult(
+                claim.event_id,
+                "STALE",
+            )
+
+        handler(conn, claim)
+
+        changed = conn.execute(
+            text("""
+                UPDATE inbox_events
+                SET processing_status='PROCESSED',
+                    processed_at=:at,
+                    claim_token=NULL,
+                    lease_expires_at=NULL,
+                    next_attempt_at=NULL,
+                    last_error=NULL
+                WHERE event_id=:id
+                  AND claim_token=:token
+                  AND processing_status='PROCESSING'
+            """),
+            params,
+        ).rowcount
+
+        if changed != 1:
+            raise RuntimeError(
+                "Не удалось завершить захват Inbox"
+            )
+
+    return ProcessResult(
+        claim.event_id,
+        "PROCESSED",
+    )
+
+
+def _fail_claim(
+    engine: Engine,
+    claim: InboxClaim,
+    error_code: str,
+    *,
+    now: datetime | None = None,
+    max_attempts: int = 5,
+    retry_base_seconds: int = 5,
+    check_lease: bool = False,
+) -> ProcessResult:
+    """Освобождает захват и планирует повтор."""
+
+    timestamp = _clock(now)
+    retry = claim.attempts < max_attempts
+
+    delay = min(
+        retry_base_seconds * 2 ** (claim.attempts - 1),
+        3600,
+    )
+
+    retry_at = (
+        to_utc_iso(
+            timestamp + timedelta(seconds=delay)
+        )
+        if retry
+        else None
+    )
+
+    params = {
+        "id": claim.event_id,
+        "token": claim.claim_token,
+        "status": "PENDING" if retry else "FAILED",
+        "retry_at": retry_at,
+        "error": error_code[:100],
+        "at": to_utc_iso(timestamp),
+    }
+
+    lease_condition = (
+        "AND lease_expires_at > :at"
+        if check_lease
+        else ""
+    )
+
+    with write_transaction(engine) as conn:
+        changed = conn.execute(
+            text(f"""
+                UPDATE inbox_events
+                SET processing_status=:status,
+                    claim_token=NULL,
+                    lease_expires_at=NULL,
+                    next_attempt_at=:retry_at,
+                    last_error=:error
+                WHERE event_id=:id
+                  AND claim_token=:token
+                  AND processing_status='PROCESSING'
+                  {lease_condition}
+            """),
+            params,
+        ).rowcount
+
+    if changed != 1:
+        return ProcessResult(
+            claim.event_id,
+            "STALE",
+        )
+
+    return ProcessResult(
+        claim.event_id,
+        "RETRY" if retry else "FAILED",
+    )
+
+
 def process_one_inbox_event(
     engine: Engine,
     handler: InboxHandler,
@@ -206,24 +370,14 @@ def process_one_inbox_event(
     max_attempts: int = 5,
     retry_base_seconds: int = 5,
 ) -> ProcessResult | None:
-    """Обрабатывает одно событие с атомарным сохранением.
-
-    handler вызывается внутри SQLite-транзакции.
-    Нельзя выполнять HTTP, DNS или commit внутри handler.
-    """
+    """Существующий синхронный режим A21."""
 
     if not callable(handler):
         raise ValueError(
             "Требуется реальный обработчик события"
         )
 
-    if (
-        type(retry_base_seconds) is not int
-        or not 1 <= retry_base_seconds <= 3600
-    ):
-        raise ValueError(
-            "retry_base_seconds должен быть от 1 до 3600"
-        )
+    _retry_limit(retry_base_seconds)
 
     timestamp = _clock(now)
 
@@ -238,113 +392,99 @@ def process_one_inbox_event(
         return None
 
     try:
-        with write_transaction(engine) as conn:
-            # Только актуальный владелец может
-            # применить изменение к базе.
-            owned = conn.execute(
-                text("""
-                    SELECT 1
-                    FROM inbox_events
-                    WHERE event_id=:id
-                      AND claim_token=:token
-                      AND processing_status='PROCESSING'
-                """),
-                {
-                    "id": claim.event_id,
-                    "token": claim.claim_token,
-                },
-            ).scalar_one_or_none()
-
-            if owned is None:
-                return ProcessResult(
-                    claim.event_id,
-                    "STALE",
-                )
-
-            # Здесь позже подключим бизнес-логику A22.
-            handler(conn, claim)
-
-            conn.execute(
-                text("""
-                    UPDATE inbox_events
-                    SET processing_status='PROCESSED',
-                        processed_at=:at,
-                        claim_token=NULL,
-                        lease_expires_at=NULL,
-                        next_attempt_at=NULL,
-                        last_error=NULL
-                    WHERE event_id=:id
-                      AND claim_token=:token
-                      AND processing_status='PROCESSING'
-                """),
-                {
-                    "id": claim.event_id,
-                    "token": claim.claim_token,
-                    "at": to_utc_iso(
-                        _clock(None)
-                        if now is None
-                        else timestamp
-                    ),
-                },
-            )
-
-        return ProcessResult(
-            claim.event_id,
-            "PROCESSED",
+        return _apply_claim(
+            engine,
+            claim,
+            handler,
+            now=now,
         )
 
     except Exception as exc:
-        # Не сохраняем текст исключения:
-        # он может содержать секреты.
-        error_code = type(exc).__name__[:100]
-
-        retry = claim.attempts < max_attempts
-
-        delay = min(
-            retry_base_seconds
-            * 2 ** (claim.attempts - 1),
-            3600,
+        return _fail_claim(
+            engine,
+            claim,
+            type(exc).__name__,
+            now=now,
+            max_attempts=max_attempts,
+            retry_base_seconds=retry_base_seconds,
         )
 
-        retry_at = (
-            to_utc_iso(
-                timestamp + timedelta(seconds=delay)
-            )
-            if retry
-            else None
+
+async def process_one_inbox_event_async(
+    engine: Engine,
+    prepare: InboxPreparer,
+    handler: InboxPreparedHandler,
+    *,
+    now: datetime | None = None,
+    lease_seconds: int = 60,
+    max_attempts: int = 5,
+    retry_base_seconds: int = 5,
+) -> ProcessResult | None:
+    """Новый двухэтапный режим Oracle Sync.
+
+    prepare(claim):
+        Асинхронная подготовка без write_transaction.
+
+    handler(conn, claim, prepared):
+        Только операции SQLite. Запускается внутри
+        write_transaction вместе с отметкой PROCESSED.
+
+    Если подготовка не удалась, событие возвращается
+    в PENDING или получает статус FAILED.
+    """
+
+    if not callable(prepare) or not callable(handler):
+        raise ValueError(
+            "Нужны функции подготовки и применения"
         )
 
-        with write_transaction(engine) as conn:
-            row_count = conn.execute(
-                text("""
-                    UPDATE inbox_events
-                    SET processing_status=:status,
-                        claim_token=NULL,
-                        lease_expires_at=NULL,
-                        next_attempt_at=:retry_at,
-                        last_error=:error
-                    WHERE event_id=:id
-                      AND claim_token=:token
-                      AND processing_status='PROCESSING'
-                """),
-                {
-                    "id": claim.event_id,
-                    "token": claim.claim_token,
-                    "status": (
-                        "PENDING" if retry else "FAILED"
-                    ),
-                    "retry_at": retry_at,
-                    "error": error_code,
-                },
-            ).rowcount
+    _limits(
+        lease_seconds=lease_seconds,
+        max_attempts=max_attempts,
+    )
+    _retry_limit(retry_base_seconds)
 
-        if not row_count:
-            return ProcessResult(
-                claim.event_id,
-                "STALE",
-            )
+    claim = await asyncio.to_thread(
+        claim_inbox_event,
+        engine,
+        now=now,
+        lease_seconds=lease_seconds,
+        max_attempts=max_attempts,
+    )
 
-        return ProcessResult(
-            claim.event_id,
-            "RETRY" if retry else "FAILED",
+    if claim is None:
+        return None
+
+    try:
+        # ВАЖНО: здесь транзакция SQLite не открыта.
+        prepared = await prepare(claim)
+
+        def apply_inside_transaction(
+            conn: Connection,
+            selected: InboxClaim,
+        ) -> None:
+            handler(conn, selected, prepared)
+
+        # Проверяем lease перед применением.
+        return await asyncio.to_thread(
+            _apply_claim,
+            engine,
+            claim,
+            apply_inside_transaction,
+            now=now,
+            check_lease=True,
+        )
+
+    except Exception as exc:
+        # Сохраняем только тип исключения,
+        # не раскрывая адреса и содержимое события.
+        return await asyncio.to_thread(
+            _fail_claim,
+            engine,
+            claim,
+            type(exc).__name__,
+            now=now,
+            max_attempts=max_attempts,
+            retry_base_seconds=retry_base_seconds,
+            check_lease=True,
         )
