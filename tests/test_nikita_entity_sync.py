@@ -1,4 +1,3 @@
-
 """N21: тесты полного импорта Entity API в SQLite без реальной сети ТПУ."""
 from __future__ import annotations
 
