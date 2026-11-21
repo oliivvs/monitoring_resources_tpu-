@@ -1,8 +1,10 @@
 
-"""A22.6: соединение Oracle Sync с Inbox Worker.
+"""A23.1: классификация ошибок Oracle Sync Inbox.
 
-prepare() работает вне SQLite write_transaction.
-apply() работает внутри write_transaction.
+Постоянные ошибки прекращают обработку сразу.
+Временные ошибки остаются в механизме retry.
+
+Сетевые проверки выполняются вне SQLite-транзакции.
 """
 
 from __future__ import annotations
@@ -21,16 +23,33 @@ from integrations.tpu.oracle_models import (
     OracleSyncEvent,
 )
 from integrations.tpu.oracle_prepare import (
+    FullSnapshotRequired,
+    OraclePreparationError,
     prepare_oracle_resource,
 )
 
-from services.inbox_worker import InboxClaim
-from services.oracle_apply import apply_prepared_oracle_resource
-from services.oracle_delete import apply_oracle_delete
+from services.inbox_worker import (
+    InboxClaim,
+    PermanentInboxError,
+)
+from services.oracle_apply import (
+    OracleApplyError,
+    UnknownSourceResource,
+    apply_prepared_oracle_resource,
+)
+from services.oracle_delete import (
+    OracleDeleteError,
+    apply_oracle_delete,
+)
+from services.source_mapping import SourceMappingError
+from services.source_sequence import (
+    MissingSourceSequence,
+    SourceSequenceConflict,
+)
 
 
-class OracleInboxError(ValueError):
-    """Некорректное событие Oracle Sync."""
+class OracleInboxError(PermanentInboxError):
+    """Постоянная ошибка события Oracle Sync."""
 
 
 @dataclass(frozen=True)
@@ -40,7 +59,7 @@ class PreparedOracleEvent:
 
 
 class OracleInboxHandler:
-    """Адаптер бизнес-логики к Inbox Worker."""
+    """Обработчик Oracle Sync для двухэтапного Worker."""
 
     def __init__(self, mapper: EntityMapper) -> None:
         self._mapper = mapper
@@ -49,15 +68,16 @@ class OracleInboxHandler:
         self,
         claim: InboxClaim,
     ) -> PreparedOracleEvent:
-        """Проверяет событие без транзакции записи."""
+        """Подготавливает событие без write_transaction."""
 
         try:
             event = OracleSyncEvent.model_validate_json(
                 claim.payload_json
             )
+
         except (ValidationError, ValueError):
             raise OracleInboxError(
-                "Событие Inbox не соответствует контракту"
+                "Повреждённое событие Inbox"
             ) from None
 
         if (
@@ -71,7 +91,7 @@ class OracleInboxHandler:
             )
         ):
             raise OracleInboxError(
-                "Данные Inbox не совпадают с событием"
+                "Поля события не совпадают с Inbox"
             )
 
         if (
@@ -79,22 +99,32 @@ class OracleInboxHandler:
             or event.entity != self._mapper.mapping.source_entity
         ):
             raise OracleInboxError(
-                "Источник или сущность не поддерживается"
+                "Неподдерживаемый источник или сущность"
             )
 
         if event.operation_code == 2:
-            # DELETE не требует DNS или получения target.
             return PreparedOracleEvent(
                 event=event,
                 resource=None,
             )
 
-        # INSERT / UPDATE:
-        # проверка mapping, адреса, allowlist и DNS.
-        resource = await prepare_oracle_resource(
-            event,
-            self._mapper,
-        )
+        try:
+            resource = await prepare_oracle_resource(
+                event,
+                self._mapper,
+            )
+
+        except FullSnapshotRequired:
+            # До A23.2 оставляем возможность retry.
+            raise
+
+        except (
+            OraclePreparationError,
+            MissingSourceSequence,
+        ):
+            raise OracleInboxError(
+                "Некорректные поля события"
+            ) from None
 
         return PreparedOracleEvent(
             event=event,
@@ -107,35 +137,63 @@ class OracleInboxHandler:
         claim: InboxClaim,
         prepared: PreparedOracleEvent,
     ) -> None:
-        """Применяет изменения только внутри SQLite."""
+        """Применяет событие атомарно внутри SQLite."""
 
         event = prepared.event
 
         if event.operation_code == 2:
-            apply_oracle_delete(
-                conn,
-                claim,
-                event,
-                expected_source=(
-                    self._mapper.mapping.source_system
-                ),
-                expected_entity=(
-                    self._mapper.mapping.source_entity
-                ),
-            )
+            try:
+                apply_oracle_delete(
+                    conn,
+                    claim,
+                    event,
+                    expected_source=(
+                        self._mapper.mapping.source_system
+                    ),
+                    expected_entity=(
+                        self._mapper.mapping.source_entity
+                    ),
+                )
+
+            except (
+                OracleDeleteError,
+                SourceSequenceConflict,
+                MissingSourceSequence,
+                SourceMappingError,
+            ):
+                raise OracleInboxError(
+                    "Постоянная ошибка DELETE"
+                ) from None
+
             return
 
         if prepared.resource is None:
             raise OracleInboxError(
-                "Не подготовлена конфигурация ресурса"
+                "Отсутствует подготовленный ресурс"
             )
 
-        apply_prepared_oracle_resource(
-            conn,
-            claim,
-            event,
-            prepared.resource,
-            resource_id_prefix=(
-                self._mapper.mapping.resource_id_prefix
-            ),
-        )
+        try:
+            apply_prepared_oracle_resource(
+                conn,
+                claim,
+                event,
+                prepared.resource,
+                resource_id_prefix=(
+                    self._mapper.mapping.resource_id_prefix
+                ),
+            )
+
+        except UnknownSourceResource:
+            # UPDATE мог прийти раньше INSERT.
+            # Сохраняем возможность повторной обработки.
+            raise
+
+        except (
+            OracleApplyError,
+            SourceMappingError,
+            SourceSequenceConflict,
+            MissingSourceSequence,
+        ):
+            raise OracleInboxError(
+                "Постоянная ошибка INSERT/UPDATE"
+            ) from None

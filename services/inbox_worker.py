@@ -27,6 +27,10 @@ from db.session import write_transaction
 from shared.schemas import to_utc_iso
 
 
+class PermanentInboxError(ValueError):
+    """Ошибка, которую повторная обработка не исправит."""
+
+
 @dataclass(frozen=True)
 class InboxClaim:
     event_id: str
@@ -298,11 +302,12 @@ def _fail_claim(
     max_attempts: int = 5,
     retry_base_seconds: int = 5,
     check_lease: bool = False,
+    permanent: bool = False,
 ) -> ProcessResult:
-    """Освобождает захват и планирует повтор."""
+    """Освобождает захват: RETRY или окончательный FAILED."""
 
     timestamp = _clock(now)
-    retry = claim.attempts < max_attempts
+    retry = not permanent and claim.attempts < max_attempts
 
     delay = min(
         retry_base_seconds * 2 ** (claim.attempts - 1),
@@ -405,6 +410,7 @@ def process_one_inbox_event(
             claim,
             type(exc).__name__,
             now=now,
+            permanent=isinstance(exc, PermanentInboxError),
             max_attempts=max_attempts,
             retry_base_seconds=retry_base_seconds,
         )
@@ -484,6 +490,7 @@ async def process_one_inbox_event_async(
             claim,
             type(exc).__name__,
             now=now,
+            permanent=isinstance(exc, PermanentInboxError),
             max_attempts=max_attempts,
             retry_base_seconds=retry_base_seconds,
             check_lease=True,

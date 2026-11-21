@@ -452,3 +452,43 @@ def test_inbox_loop_requires_handler(engine):
             apply_ok,
             max_attempts=0,
         )
+
+def test_permanent_failure_has_no_retry(engine):
+    from services.inbox_worker import PermanentInboxError
+
+    event_id = put(engine)
+
+    def permanent_failure(conn, claim):
+        apply_ok(conn, claim)
+        raise PermanentInboxError("secret=must-not-leak")
+
+    result = process_one_inbox_event(
+        engine,
+        permanent_failure,
+        now=NOW,
+        max_attempts=5,
+    )
+
+    assert result.disposition == "FAILED"
+
+    saved = row(engine, event_id)
+
+    assert saved["processing_status"] == "FAILED"
+    assert saved["attempts"] == 1
+    assert saved["last_error"] == "PermanentInboxError"
+    assert saved["next_attempt_at"] is None
+    assert saved["claim_token"] is None
+    assert "secret" not in str(saved["last_error"])
+
+    with read_transaction(engine) as conn:
+        count = conn.execute(
+            text("SELECT COUNT(*) FROM applied_events")
+        ).scalar_one()
+
+    assert count == 0
+
+    assert process_one_inbox_event(
+        engine,
+        apply_ok,
+        now=NOW + timedelta(days=1),
+    ) is None

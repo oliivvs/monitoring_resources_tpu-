@@ -411,3 +411,152 @@ async def test_loop_processes_post_automatically(
 
     assert resource_state(engine)["active"] == 1
     assert last_sequence(engine) == 10
+
+
+@pytest.mark.asyncio
+async def test_unsupported_source_failed_immediately(
+    environment,
+):
+    engine, client, bridge = environment
+
+    event_id = str(uuid4())
+
+    payload = {
+        "event_id": event_id,
+        "source": "unsupported-source",
+        "entity": "servers",
+        "record_id": "server-17",
+        "operation_code": 1,
+        "source_sequence": 10,
+        "occurred_at": "2026-11-21T12:00:00Z",
+        "data": full_data(),
+    }
+
+    response = client.post(
+        API_PATH,
+        json=payload,
+        headers={
+            "Authorization": f"Bearer {SYNC_TOKEN}"
+        },
+    )
+
+    assert response.status_code == 202
+
+    result = await process(engine, bridge)
+
+    assert result.disposition == "FAILED"
+
+    saved = event_status(engine, event_id)
+
+    assert saved["processing_status"] == "FAILED"
+    assert saved["attempts"] == 1
+    assert saved["last_error"] == "OracleInboxError"
+    assert last_sequence(engine) is None
+
+
+@pytest.mark.asyncio
+async def test_invalid_resource_fields_failed_immediately(
+    environment,
+):
+    engine, client, bridge = environment
+
+    event_id = send(
+        client,
+        10,
+        data=full_data(active="not-a-boolean"),
+    )
+
+    result = await process(engine, bridge)
+
+    assert result.disposition == "FAILED"
+    assert event_status(engine, event_id)["attempts"] == 1
+    assert event_status(engine, event_id)[
+        "last_error"
+    ] == "OracleInboxError"
+    assert resource_state(engine) is None
+    assert last_sequence(engine) is None
+
+
+@pytest.mark.asyncio
+async def test_sequence_conflict_failed_immediately(
+    environment,
+):
+    engine, client, bridge = environment
+
+    send(client, 10)
+
+    first = await process(engine, bridge)
+    assert first.disposition == "PROCESSED"
+
+    event_id = send(
+        client,
+        10,
+        operation=3,
+        data=full_data(name="Конфликтующая версия"),
+    )
+
+    result = await process(engine, bridge)
+
+    assert result.disposition == "FAILED"
+    assert event_status(engine, event_id)["attempts"] == 1
+    assert event_status(engine, event_id)[
+        "last_error"
+    ] == "OracleInboxError"
+
+    assert last_sequence(engine) == 10
+    assert resource_state(engine)["name"] == "Сервер ТПУ"
+    assert resource_state(engine)["version_number"] == 1
+
+
+@pytest.mark.asyncio
+async def test_unknown_update_still_retries(
+    environment,
+):
+    engine, client, bridge = environment
+
+    event_id = send(
+        client,
+        10,
+        operation=3,
+        data=full_data(),
+    )
+
+    result = await process(engine, bridge)
+
+    assert result.disposition == "RETRY"
+
+    saved = event_status(engine, event_id)
+
+    assert saved["processing_status"] == "PENDING"
+    assert saved["attempts"] == 1
+    assert saved["last_error"] == "UnknownSourceResource"
+
+    assert resource_state(engine) is None
+    assert last_sequence(engine) is None
+
+
+@pytest.mark.asyncio
+async def test_delete_without_sequence_failed_immediately(
+    environment,
+):
+    engine, client, bridge = environment
+
+    event_id = send(
+        client,
+        None,
+        operation=2,
+        data={},
+    )
+
+    result = await process(engine, bridge)
+
+    assert result.disposition == "FAILED"
+
+    saved = event_status(engine, event_id)
+
+    assert saved["processing_status"] == "FAILED"
+    assert saved["attempts"] == 1
+    assert saved["last_error"] == "OracleInboxError"
+
+    assert last_sequence(engine) is None
+    assert resource_state(engine) is None

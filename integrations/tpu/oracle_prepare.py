@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from integrations.tpu.entity_mapper import (
     EntityMapper,
+    EntityMappingError,
     MappedResource,
 )
 from integrations.tpu.oracle_models import OracleSyncEvent
@@ -105,7 +106,12 @@ async def prepare_oracle_resource(
             )
 
     # Повторно используем строгую проверку Никиты.
-    item = mapper.map_record(record)
+    try:
+        item = mapper.map_record(record)
+    except EntityMappingError:
+        raise OraclePreparationError(
+            "Некорректная конфигурация ресурса"
+        ) from None
 
     if item.source_record_id != event.record_id:
         raise OraclePreparationError(
