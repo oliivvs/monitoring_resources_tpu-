@@ -73,6 +73,21 @@ services:
       migrate:
         condition: service_completed_successfully
     restart: unless-stopped
+  oracle-worker:
+    <<: *db-service
+    profiles:
+      - oracle-lab
+    command: [python, -m, scripts.run_inbox_worker]
+    environment:
+      MONITORING_DATABASE_URL: sqlite:////data/monitoring.db
+      MONITORING_ORACLE_ENABLED: ${MONITORING_ORACLE_ENABLED:-false}
+      MONITORING_ORACLE_ALLOWED_HOSTS: ${MONITORING_ORACLE_ALLOWED_HOSTS:-}
+      MONITORING_ORACLE_ALLOWED_PORTS: ${MONITORING_ORACLE_ALLOWED_PORTS:-}
+      MONITORING_ORACLE_MAPPING_PATH: config/tpu_oracle_mapping.yaml
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: "no"
 
 volumes:
   monitoring-data:
