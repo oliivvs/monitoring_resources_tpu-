@@ -1,4 +1,3 @@
-
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -6,20 +5,24 @@ cd "$(dirname "$0")/.."
 mkdir -p test_reports
 
 echo "=== 1. Проверка синтаксиса ==="
+
 python3 -m compileall -q \
   app checks db integrations migrations \
   mock_api mock_entity_api scripts services shared tests
 
 echo "=== 2. Все автоматические тесты ==="
+
 python3 -m pytest -q \
   --junitxml=test_reports/pytest_all.xml \
   | tee test_reports/pytest_all.txt
 
 echo "=== 3. Локальный HTTP и Outbox ==="
+
 python3 -m scripts.local_smoke \
   | tee test_reports/local_smoke.txt
 
 echo "=== 4. Oracle Sync и защищённый GET ==="
+
 python3 -m scripts.demo_artemiy \
   | tee test_reports/artemiy_demo.txt
 
@@ -33,8 +36,10 @@ cleanup() {
     docker compose -p "$PROJECT" down -v \
       --remove-orphans >/dev/null 2>&1 || true
   fi
+
   rm -rf "$TMP_DIR"
 }
+
 trap cleanup EXIT
 
 export MONITORING_DATABASE_URL="sqlite:///$TMP_DIR/test.sqlite"
@@ -46,38 +51,59 @@ python3 - <<'PY'
 import os
 import sqlite3
 
-path = os.environ["MONITORING_DATABASE_URL"].removeprefix("sqlite:///")
+path = os.environ["MONITORING_DATABASE_URL"].removeprefix(
+    "sqlite:///"
+)
+
 conn = sqlite3.connect(path)
 
-tables = {
-    row[0]
-    for row in conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table'"
+try:
+    tables = {
+        row[0]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        )
+    }
+
+    required = {
+        "resources",
+        "resource_config_versions",
+        "http_expected_ranges",
+        "resource_states",
+        "check_results",
+        "status_transitions",
+        "outbox_events",
+        "delivery_attempts",
+        "inbox_events",
+        "resource_source_mappings",
+        "resource_source_sequences",
+    }
+
+    missing = required - tables
+
+    assert not missing, f"Отсутствуют таблицы: {missing}"
+
+    assert (
+        conn.execute("PRAGMA integrity_check").fetchone()[0]
+        == "ok"
     )
-}
 
-required = {
-    "resources",
-    "resource_config_versions",
-    "http_expected_ranges",
-    "resource_states",
-    "check_results",
-    "status_transitions",
-    "outbox_events",
-    "delivery_attempts",
-    "inbox_events",
-    "resource_source_mappings",
-}
+    assert not conn.execute(
+        "PRAGMA foreign_key_check"
+    ).fetchall()
 
-assert required <= tables, f"Отсутствуют: {required - tables}"
-assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
-assert not conn.execute("PRAGMA foreign_key_check").fetchall()
-assert conn.execute(
-    "SELECT version_num FROM alembic_version"
-).fetchone()[0] == "003_tpu_inbox"
+    version = conn.execute(
+        "SELECT version_num FROM alembic_version"
+    ).fetchone()[0]
 
-print("PASS: 10 таблиц, внешние ключи, миграции")
-conn.close()
+    assert version == "005_source_sequence", version
+
+    print(
+        "PASS: 11 предметных таблиц, "
+        "внешние ключи, миграции 001-005"
+    )
+finally:
+    conn.close()
 PY
 
 if [[ "${1:-}" == "--docker" ]]; then
@@ -102,6 +128,7 @@ if [[ "${1:-}" == "--docker" ]]; then
   BEFORE="$(docker compose -p "$PROJECT" exec -T api python -c "$STATE_QUERY")"
 
   echo "=== 7. Docker: сохранность после перезапуска ==="
+
   docker compose -p "$PROJECT" restart api sender scheduler
 
   AFTER="$(docker compose -p "$PROJECT" exec -T api python -c "$STATE_QUERY")"
