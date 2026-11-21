@@ -1,10 +1,13 @@
+"""A23.2.2: обработка Oracle Sync с поддержкой частичных UPDATE.
 
-"""A23.1: классификация ошибок Oracle Sync Inbox.
+prepare():
+- проверяет событие;
+- при частичном UPDATE получает полный снимок;
+- проверяет снимок через EntityMapper;
+- не выполняет запись в SQLite.
 
-Постоянные ошибки прекращают обработку сразу.
-Временные ошибки остаются в механизме retry.
-
-Сетевые проверки выполняются вне SQLite-транзакции.
+apply():
+- атомарно применяет подготовленную конфигурацию.
 """
 
 from __future__ import annotations
@@ -14,6 +17,11 @@ from dataclasses import dataclass
 from pydantic import ValidationError
 from sqlalchemy.engine import Connection
 
+from integrations.tpu.entity_client import (
+    EntityApiHttpError,
+    EntityApiSchemaError,
+    TpuEntityClient,
+)
 from integrations.tpu.entity_mapper import (
     EntityMapper,
     MappedResource,
@@ -26,6 +34,10 @@ from integrations.tpu.oracle_prepare import (
     FullSnapshotRequired,
     OraclePreparationError,
     prepare_oracle_resource,
+)
+from integrations.tpu.oracle_snapshot import (
+    OracleSnapshotContractError,
+    fetch_full_oracle_snapshot,
 )
 
 from services.inbox_worker import (
@@ -59,16 +71,99 @@ class PreparedOracleEvent:
 
 
 class OracleInboxHandler:
-    """Обработчик Oracle Sync для двухэтапного Worker."""
+    """Адаптер Oracle Sync к двухэтапному Inbox Worker."""
 
-    def __init__(self, mapper: EntityMapper) -> None:
+    def __init__(
+        self,
+        mapper: EntityMapper,
+        *,
+        snapshot_client: TpuEntityClient | None = None,
+    ) -> None:
         self._mapper = mapper
+        self._snapshot_client = snapshot_client
+
+    async def _prepare_partial_update(
+        self,
+        event: OracleSyncEvent,
+    ) -> MappedResource:
+        """Получает и проверяет полный снимок UPDATE."""
+
+        if self._snapshot_client is None:
+            # Старое поведение: пока нет Entity API,
+            # событие остаётся доступным для retry.
+            raise FullSnapshotRequired(
+                "Получение полного снимка не настроено"
+            )
+
+        try:
+            snapshot = await fetch_full_oracle_snapshot(
+                self._snapshot_client,
+                event,
+                self._mapper.mapping,
+            )
+
+        except OracleSnapshotContractError:
+            raise OracleInboxError(
+                "Неверный контракт полного снимка"
+            ) from None
+
+        except EntityApiHttpError as exc:
+            if not exc.retryable:
+                raise OracleInboxError(
+                    "Entity API отклонил запрос"
+                ) from None
+
+            # HTTP 429 и 5xx: повторная попытка.
+            raise
+
+        except EntityApiSchemaError:
+            raise OracleInboxError(
+                "Entity API вернул неверную схему"
+            ) from None
+
+        # Не позволяем API подменить значения полей,
+        # уже присутствующих в уведомлении.
+        # Неизвестные поля уведомления не сравниваем:
+        # они могут содержать служебные метаданные.
+        known_fields = set(
+            self._mapper.mapping.fields.values()
+        )
+
+        for name, value in event.data.items():
+            if (
+                name in known_fields
+                and snapshot.get(name) != value
+            ):
+                raise OracleInboxError(
+                    "Данные уведомления и снимка не совпадают"
+                )
+
+        # Подменяем data только у временного экземпляра,
+        # используемого для валидации и подготовки.
+        # Исходный event и сохранённый JSON не изменяются.
+        snapshot_event = event.model_copy(
+            update={"data": snapshot}
+        )
+
+        try:
+            return await prepare_oracle_resource(
+                snapshot_event,
+                self._mapper,
+            )
+
+        except (
+            OraclePreparationError,
+            MissingSourceSequence,
+        ):
+            raise OracleInboxError(
+                "Полный снимок содержит некорректные поля"
+            ) from None
 
     async def prepare(
         self,
         claim: InboxClaim,
     ) -> PreparedOracleEvent:
-        """Подготавливает событие без write_transaction."""
+        """Проверяет событие вне транзакции SQLite."""
 
         try:
             event = OracleSyncEvent.model_validate_json(
@@ -115,8 +210,12 @@ class OracleInboxHandler:
             )
 
         except FullSnapshotRequired:
-            # До A23.2 оставляем возможность retry.
-            raise
+            if event.operation_code != 3:
+                raise
+
+            resource = await self._prepare_partial_update(
+                event
+            )
 
         except (
             OraclePreparationError,
@@ -137,7 +236,7 @@ class OracleInboxHandler:
         claim: InboxClaim,
         prepared: PreparedOracleEvent,
     ) -> None:
-        """Применяет событие атомарно внутри SQLite."""
+        """Атомарно применяет событие внутри SQLite."""
 
         event = prepared.event
 
@@ -185,7 +284,6 @@ class OracleInboxHandler:
 
         except UnknownSourceResource:
             # UPDATE мог прийти раньше INSERT.
-            # Сохраняем возможность повторной обработки.
             raise
 
         except (
