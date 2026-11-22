@@ -1,0 +1,6 @@
+source_entity: servers
+records_path: /lab/tpu/entity/v2/entities/{entity_id}/records
+identity_field: source_record_id
+sequence_field: source_sequence
+response_items_field: items
+response_cursor_field: next_cursor
