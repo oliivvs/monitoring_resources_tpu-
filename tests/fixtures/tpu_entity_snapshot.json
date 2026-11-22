@@ -1,0 +1,22 @@
+{
+  "items": [
+    {
+      "source_record_id": "example-server-001",
+      "source_sequence": 2,
+      "name": "Тестовый сервер ТПУ",
+      "target": "https://1.1.1.1/health",
+      "check_type": "HTTP",
+      "active": true,
+      "port": null,
+      "interval_seconds": 120,
+      "timeout_seconds": 5.0,
+      "expected_http_codes": [
+        {"start": 200, "end": 299}
+      ],
+      "up_after": 2,
+      "down_after": 3,
+      "heartbeat_interval_seconds": 300
+    }
+  ],
+  "next_cursor": null
+}
