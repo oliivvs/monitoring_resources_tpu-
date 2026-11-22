@@ -1335,3 +1335,127 @@ async def test_async_inbox_exhausts_retries_without_changes(
         now=now + timedelta(days=1),
         max_attempts=2,
     ) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "snapshot_sequence, expected",
+    [
+        (11, "PROCESSED"),
+        (12, "RETRY"),
+    ],
+)
+async def test_yaml_contract_partial_update_pipeline(
+    environment,
+    snapshot_sequence,
+    expected,
+):
+    """Частичный UPDATE через маршрут из YAML-контракта."""
+
+    import httpx
+
+    from scripts.run_inbox_worker import (
+        OracleWorkerSettings,
+        build_snapshot_client,
+    )
+
+    engine, api_client, original_bridge = environment
+
+    # Создаём исходную конфигурацию.
+    send(api_client, 10)
+    initial = await process(engine, original_bridge)
+
+    assert initial.disposition == "PROCESSED"
+
+    event_id = send(
+        api_client,
+        11,
+        operation=3,
+        data={"name": "Сервер после обновления"},
+    )
+
+    requested = []
+
+    def snapshot_response(request):
+        requested.append(request)
+
+        return httpx.Response(
+            200,
+            json={
+                "items": [
+                    make_snapshot_record(
+                        sequence=snapshot_sequence,
+                        name="Сервер после обновления",
+                        interval_seconds=90,
+                    )
+                ],
+                "next_cursor": None,
+            },
+        )
+
+    settings = OracleWorkerSettings(
+        _env_file=None,
+        enabled=True,
+        mapping_path=MAPPING_PATH,
+        snapshot_enabled=True,
+        snapshot_base_url="https://entity.example.org",
+        snapshot_allowed_hosts="entity.example.org",
+        snapshot_allowed_cidrs="",
+        snapshot_token="test-only-token",
+        snapshot_contract_path=(
+            MAPPING_PATH.parent
+            / "tpu_entity_contract_lab.yaml"
+        ),
+    )
+
+    snapshot_client = build_snapshot_client(
+        settings,
+        mapping=original_bridge._mapper.mapping,
+    )
+
+    assert snapshot_client is not None
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(snapshot_response),
+    ) as http_client:
+
+        # Подмена транспорта только внутри теста.
+        snapshot_client._http_client = http_client
+
+        bridge = OracleInboxHandler(
+            original_bridge._mapper,
+            snapshot_client=snapshot_client,
+        )
+
+        result = await process(engine, bridge)
+
+    assert result.disposition == expected
+
+    assert len(requested) == 1
+    assert requested[0].url.path == (
+        "/lab/tpu/entity/v2/entities/servers/records"
+    )
+    assert requested[0].url.params["source_record_id"] == (
+        "server-17"
+    )
+    assert requested[0].headers["authorization"] == (
+        "Bearer test-only-token"
+    )
+
+    state = resource_state(engine)
+    saved = event_status(engine, event_id)
+
+    if expected == "PROCESSED":
+        assert saved["processing_status"] == "PROCESSED"
+        assert state["name"] == "Сервер после обновления"
+        assert state["interval_seconds"] == 90
+        assert state["version_number"] == 2
+        assert last_sequence(engine) == 11
+
+    else:
+        assert saved["processing_status"] == "PENDING"
+        assert saved["last_error"] == "OracleSnapshotNotReady"
+        assert state["name"] == "Сервер ТПУ"
+        assert state["interval_seconds"] == 60
+        assert state["version_number"] == 1
+        assert last_sequence(engine) == 10
