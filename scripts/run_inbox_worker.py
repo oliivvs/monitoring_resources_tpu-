@@ -12,8 +12,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import signal
 
+from dataclasses import replace
 from pathlib import Path
 from ipaddress import ip_address, ip_network
 from urllib.parse import urlsplit
@@ -67,6 +69,7 @@ class OracleWorkerSettings(BaseSettings):
     # Snapshot API выключен по умолчанию.
     snapshot_enabled: bool = False
     snapshot_base_url: str | None = None
+    snapshot_records_path: str | None = None
     snapshot_allowed_hosts: str = ""
     snapshot_allowed_cidrs: str = ""
     snapshot_token: SecretStr | None = None
@@ -219,9 +222,40 @@ def build_snapshot_client(
     for cidr in cidrs:
         ip_network(cidr, strict=True)
 
+    routes = EntityRoutes.local_mock()
+
+    if settings.snapshot_records_path is not None:
+        path = settings.snapshot_records_path
+        segments = path.split("/")
+
+        # Принимаем только абсолютный путь из простых
+        # сегментов и одного параметра {entity_id}.
+        # URL, query, escapes и обход каталогов запрещены.
+        if (
+            not 1 <= len(path) <= 512
+            or not path.startswith("/")
+            or segments.count("{entity_id}") != 1
+            or any(
+                segment != "{entity_id}"
+                and re.fullmatch(
+                    r"[A-Za-z0-9_-]+",
+                    segment,
+                ) is None
+                for segment in segments[1:]
+            )
+        ):
+            raise ValueError(
+                "Некорректный маршрут Snapshot API"
+            )
+
+        routes = replace(
+            routes,
+            records=path,
+        )
+
     return TpuEntityClient(
         base_url=settings.snapshot_base_url,
-        routes=EntityRoutes.local_mock(),
+        routes=routes,
         token=settings.snapshot_token,
         timeout_seconds=settings.snapshot_timeout_seconds,
         pinned_allowed_cidrs=cidrs,
