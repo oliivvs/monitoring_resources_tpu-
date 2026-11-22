@@ -30,12 +30,14 @@ from app.database import get_engine
 from checks.security import NetworkPolicy
 from db.session import read_transaction
 
+from integrations.tpu.entity_contract import load_contract
 from integrations.tpu.entity_client import (
     EntityRoutes,
     TpuEntityClient,
 )
 from integrations.tpu.entity_mapper import (
     EntityMapper,
+    MappingConfig,
     load_mapping,
 )
 from integrations.tpu.oracle_inbox_handler import OracleInboxHandler
@@ -70,6 +72,7 @@ class OracleWorkerSettings(BaseSettings):
     snapshot_enabled: bool = False
     snapshot_base_url: str | None = None
     snapshot_records_path: str | None = None
+    snapshot_contract_path: Path | None = None
     snapshot_allowed_hosts: str = ""
     snapshot_allowed_cidrs: str = ""
     snapshot_token: SecretStr | None = None
@@ -155,6 +158,8 @@ def build_network_policy(
 
 def build_snapshot_client(
     settings: OracleWorkerSettings,
+    *,
+    mapping: MappingConfig | None = None,
 ) -> TpuEntityClient | None:
     """Создаёт явно разрешённый Snapshot-клиент.
 
@@ -222,10 +227,58 @@ def build_snapshot_client(
     for cidr in cidrs:
         ip_network(cidr, strict=True)
 
+    contract_records_path = None
+
+    if settings.snapshot_contract_path is not None:
+        contract = load_contract(
+            settings.snapshot_contract_path
+        )
+
+        current_mapping = (
+            mapping
+            if mapping is not None
+            else load_mapping(settings.mapping_path)
+        )
+
+        if (
+            contract["source_entity"]
+            != current_mapping.source_entity
+        ):
+            raise ValueError(
+                "Контракт: source_entity не совпадает с mapping"
+            )
+
+        if (
+            contract["identity_field"]
+            != current_mapping.fields["source_record_id"]
+        ):
+            raise ValueError(
+                "Контракт: identity_field не совпадает с mapping"
+            )
+
+        contract_records_path = contract["records_path"]
+
+    configured_path = settings.snapshot_records_path
+
+    if (
+        configured_path is not None
+        and contract_records_path is not None
+        and configured_path != contract_records_path
+    ):
+        raise ValueError(
+            "Контракт: records_path не совпадает с настройками Worker"
+        )
+
+    selected_records_path = (
+        configured_path
+        if configured_path is not None
+        else contract_records_path
+    )
+
     routes = EntityRoutes.local_mock()
 
-    if settings.snapshot_records_path is not None:
-        path = settings.snapshot_records_path
+    if selected_records_path is not None:
+        path = selected_records_path
         segments = path.split("/")
 
         # Принимаем только абсолютный путь из простых
@@ -310,7 +363,10 @@ def build_worker(
         policy,
     )
 
-    snapshot_client = build_snapshot_client(settings)
+    snapshot_client = build_snapshot_client(
+        settings,
+        mapping=mapping,
+    )
 
     bridge = OracleInboxHandler(
         mapper,
