@@ -88,6 +88,12 @@ class OracleWorkerSettings(BaseSettings):
         le=3600,
     )
 
+    prepare_timeout_seconds: float = Field(
+        default=30.0,
+        gt=0,
+        le=120,
+    )
+
     max_attempts: int = Field(
         default=5,
         ge=1,
@@ -211,6 +217,31 @@ def build_snapshot_client(
     )
 
 
+def validate_worker_timing(
+    settings: OracleWorkerSettings,
+) -> None:
+    """Проверяет соотношение таймаутов и lease."""
+
+    if (
+        settings.prepare_timeout_seconds + 10
+        > settings.lease_seconds
+    ):
+        raise ValueError(
+            "lease_seconds должен оставлять минимум "
+            "10 секунд после подготовки"
+        )
+
+    if (
+        settings.snapshot_enabled
+        and settings.snapshot_timeout_seconds
+        >= settings.prepare_timeout_seconds
+    ):
+        raise ValueError(
+            "Таймаут Snapshot API должен быть меньше "
+            "таймаута подготовки"
+        )
+
+
 def build_worker(
     engine: Engine,
     settings: OracleWorkerSettings,
@@ -222,6 +253,8 @@ def build_worker(
             "Oracle Worker выключен. "
             "Установите MONITORING_ORACLE_ENABLED=true"
         )
+
+    validate_worker_timing(settings)
 
     mapping = load_mapping(settings.mapping_path)
 
@@ -237,6 +270,7 @@ def build_worker(
     bridge = OracleInboxHandler(
         mapper,
         snapshot_client=snapshot_client,
+        prepare_timeout_seconds=settings.prepare_timeout_seconds,
     )
 
     return InboxLoop(
