@@ -1228,3 +1228,110 @@ async def test_partial_update_timeout_then_recovers(environment):
     assert resource["version_number"] == 2
     assert resource["interval_seconds"] == 180
     assert last_sequence(engine) == 11
+
+
+@pytest.mark.asyncio
+async def test_inbox_loop_stop_finishes_current_event(environment):
+    """Штатная остановка не обрывает активную обработку."""
+
+    engine, client, bridge = environment
+
+    event_id = send(client, 10)
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def paused_prepare(claim):
+        started.set()
+        await release.wait()
+        return await bridge.prepare(claim)
+
+    worker = InboxLoop(
+        engine,
+        prepare=paused_prepare,
+        apply=bridge.apply,
+        poll_seconds=0.01,
+    )
+
+    task = asyncio.create_task(worker.run())
+
+    try:
+        await asyncio.wait_for(started.wait(), timeout=3)
+
+        worker.stop()
+
+        assert not task.done()
+
+    finally:
+        release.set()
+        await asyncio.wait_for(task, timeout=3)
+
+    saved = event_status(engine, event_id)
+
+    assert saved["processing_status"] == "PROCESSED"
+    assert saved["attempts"] == 1
+    assert resource_state(engine)["version_number"] == 1
+    assert last_sequence(engine) == 10
+
+
+@pytest.mark.asyncio
+async def test_async_inbox_exhausts_retries_without_changes(
+    environment,
+):
+    """После последней попытки событие получает FAILED."""
+
+    from datetime import timedelta
+
+    engine, client, bridge = environment
+
+    send(client, 10)
+
+    initial = await process(engine, bridge)
+    assert initial.disposition == "PROCESSED"
+
+    event_id = send(
+        client,
+        11,
+        operation=3,
+        data={"name": "Неполный UPDATE"},
+    )
+
+    now = datetime.now(timezone.utc) + timedelta(seconds=1)
+
+    first = await process(
+        engine,
+        bridge,
+        now=now,
+        max_attempts=2,
+        retry_base_seconds=5,
+    )
+
+    assert first.disposition == "RETRY"
+    assert event_status(engine, event_id)["attempts"] == 1
+
+    second = await process(
+        engine,
+        bridge,
+        now=now + timedelta(seconds=5),
+        max_attempts=2,
+        retry_base_seconds=5,
+    )
+
+    assert second.disposition == "FAILED"
+
+    saved = event_status(engine, event_id)
+
+    assert saved["processing_status"] == "FAILED"
+    assert saved["attempts"] == 2
+    assert saved["last_error"] == "FullSnapshotRequired"
+
+    assert resource_state(engine)["version_number"] == 1
+    assert resource_state(engine)["name"] == "Сервер ТПУ"
+    assert last_sequence(engine) == 10
+
+    assert await process(
+        engine,
+        bridge,
+        now=now + timedelta(days=1),
+        max_attempts=2,
+    ) is None

@@ -95,6 +95,7 @@ services:
       migrate:
         condition: service_completed_successfully
     restart: "no"
+    stop_grace_period: 45s
 
 volumes:
   monitoring-data:
