@@ -1,0 +1,66 @@
+# Только лабораторное HTTPS-тестирование Oracle Snapshot.
+
+services:
+  oracle-snapshot:
+    profiles:
+      - oracle-lab
+    build: .
+    image: tpu-monitoring:a08
+
+    # Только для локальной лаборатории:
+    # чтение временного приватного TLS-ключа.
+    user: "0:0"
+
+    command:
+      - python
+      - -m
+      - uvicorn
+      - mock_api.oracle_snapshot:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "443"
+      - --ssl-certfile
+      - /tls/server.crt
+      - --ssl-keyfile
+      - /tls/server.key
+
+    environment:
+      ORACLE_LAB_SNAPSHOT_TOKEN: ${ORACLE_LAB_SNAPSHOT_TOKEN:?Missing lab token}
+      ORACLE_LAB_RECORD_ID: docker-lab-snapshot-001
+      ORACLE_LAB_SNAPSHOT_SEQUENCE: ${ORACLE_LAB_SNAPSHOT_SEQUENCE:-2}
+      ORACLE_LAB_SNAPSHOT_INTERVAL_SECONDS: ${ORACLE_LAB_SNAPSHOT_INTERVAL_SECONDS:-120}
+
+    volumes:
+      - ${ORACLE_LAB_TLS_DIR:?Missing TLS directory}:/tls:ro
+
+    restart: "no"
+
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import ssl, urllib.request; ctx=ssl.create_default_context(cafile='/tls/ca.crt'); urllib.request.urlopen('https://oracle-snapshot/health', context=ctx, timeout=3).close()"
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  oracle-worker:
+    environment:
+      MONITORING_ORACLE_SNAPSHOT_ENABLED: "true"
+      MONITORING_ORACLE_SNAPSHOT_BASE_URL: https://oracle-snapshot
+      MONITORING_ORACLE_SNAPSHOT_ALLOWED_HOSTS: oracle-snapshot
+      MONITORING_ORACLE_SNAPSHOT_TOKEN: ${ORACLE_LAB_SNAPSHOT_TOKEN:?Missing lab token}
+      SSL_CERT_FILE: /tls/ca.crt
+
+    volumes:
+      - monitoring-data:/data
+      - ${ORACLE_LAB_TLS_DIR:?Missing TLS directory}:/tls:ro
+
+    depends_on:
+      oracle-snapshot:
+        condition: service_healthy
+
+volumes:
+  monitoring-data:

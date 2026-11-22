@@ -1,8 +1,13 @@
+"""A23.2.2: обработка Oracle Sync с поддержкой частичных UPDATE.
 
-"""A22.6: соединение Oracle Sync с Inbox Worker.
+prepare():
+- проверяет событие;
+- при частичном UPDATE получает полный снимок;
+- проверяет снимок через EntityMapper;
+- не выполняет запись в SQLite.
 
-prepare() работает вне SQLite write_transaction.
-apply() работает внутри write_transaction.
+apply():
+- атомарно применяет подготовленную конфигурацию.
 """
 
 from __future__ import annotations
@@ -12,6 +17,11 @@ from dataclasses import dataclass
 from pydantic import ValidationError
 from sqlalchemy.engine import Connection
 
+from integrations.tpu.entity_client import (
+    EntityApiHttpError,
+    EntityApiSchemaError,
+    TpuEntityClient,
+)
 from integrations.tpu.entity_mapper import (
     EntityMapper,
     MappedResource,
@@ -21,16 +31,37 @@ from integrations.tpu.oracle_models import (
     OracleSyncEvent,
 )
 from integrations.tpu.oracle_prepare import (
+    FullSnapshotRequired,
+    OraclePreparationError,
     prepare_oracle_resource,
 )
+from integrations.tpu.oracle_snapshot import (
+    OracleSnapshotContractError,
+    fetch_full_oracle_snapshot,
+)
 
-from services.inbox_worker import InboxClaim
-from services.oracle_apply import apply_prepared_oracle_resource
-from services.oracle_delete import apply_oracle_delete
+from services.inbox_worker import (
+    InboxClaim,
+    PermanentInboxError,
+)
+from services.oracle_apply import (
+    OracleApplyError,
+    UnknownSourceResource,
+    apply_prepared_oracle_resource,
+)
+from services.oracle_delete import (
+    OracleDeleteError,
+    apply_oracle_delete,
+)
+from services.source_mapping import SourceMappingError
+from services.source_sequence import (
+    MissingSourceSequence,
+    SourceSequenceConflict,
+)
 
 
-class OracleInboxError(ValueError):
-    """Некорректное событие Oracle Sync."""
+class OracleInboxError(PermanentInboxError):
+    """Постоянная ошибка события Oracle Sync."""
 
 
 @dataclass(frozen=True)
@@ -40,24 +71,108 @@ class PreparedOracleEvent:
 
 
 class OracleInboxHandler:
-    """Адаптер бизнес-логики к Inbox Worker."""
+    """Адаптер Oracle Sync к двухэтапному Inbox Worker."""
 
-    def __init__(self, mapper: EntityMapper) -> None:
+    def __init__(
+        self,
+        mapper: EntityMapper,
+        *,
+        snapshot_client: TpuEntityClient | None = None,
+    ) -> None:
         self._mapper = mapper
+        self._snapshot_client = snapshot_client
+
+    async def _prepare_partial_update(
+        self,
+        event: OracleSyncEvent,
+    ) -> MappedResource:
+        """Получает и проверяет полный снимок UPDATE."""
+
+        if self._snapshot_client is None:
+            # Старое поведение: пока нет Entity API,
+            # событие остаётся доступным для retry.
+            raise FullSnapshotRequired(
+                "Получение полного снимка не настроено"
+            )
+
+        try:
+            snapshot = await fetch_full_oracle_snapshot(
+                self._snapshot_client,
+                event,
+                self._mapper.mapping,
+            )
+
+        except OracleSnapshotContractError:
+            raise OracleInboxError(
+                "Неверный контракт полного снимка"
+            ) from None
+
+        except EntityApiHttpError as exc:
+            if not exc.retryable:
+                raise OracleInboxError(
+                    "Entity API отклонил запрос"
+                ) from None
+
+            # HTTP 429 и 5xx: повторная попытка.
+            raise
+
+        except EntityApiSchemaError:
+            raise OracleInboxError(
+                "Entity API вернул неверную схему"
+            ) from None
+
+        # Не позволяем API подменить значения полей,
+        # уже присутствующих в уведомлении.
+        # Неизвестные поля уведомления не сравниваем:
+        # они могут содержать служебные метаданные.
+        known_fields = set(
+            self._mapper.mapping.fields.values()
+        )
+
+        for name, value in event.data.items():
+            if (
+                name in known_fields
+                and snapshot.get(name) != value
+            ):
+                raise OracleInboxError(
+                    "Данные уведомления и снимка не совпадают"
+                )
+
+        # Подменяем data только у временного экземпляра,
+        # используемого для валидации и подготовки.
+        # Исходный event и сохранённый JSON не изменяются.
+        snapshot_event = event.model_copy(
+            update={"data": snapshot}
+        )
+
+        try:
+            return await prepare_oracle_resource(
+                snapshot_event,
+                self._mapper,
+            )
+
+        except (
+            OraclePreparationError,
+            MissingSourceSequence,
+        ):
+            raise OracleInboxError(
+                "Полный снимок содержит некорректные поля"
+            ) from None
 
     async def prepare(
         self,
         claim: InboxClaim,
     ) -> PreparedOracleEvent:
-        """Проверяет событие без транзакции записи."""
+        """Проверяет событие вне транзакции SQLite."""
 
         try:
             event = OracleSyncEvent.model_validate_json(
                 claim.payload_json
             )
+
         except (ValidationError, ValueError):
             raise OracleInboxError(
-                "Событие Inbox не соответствует контракту"
+                "Повреждённое событие Inbox"
             ) from None
 
         if (
@@ -71,7 +186,7 @@ class OracleInboxHandler:
             )
         ):
             raise OracleInboxError(
-                "Данные Inbox не совпадают с событием"
+                "Поля события не совпадают с Inbox"
             )
 
         if (
@@ -79,22 +194,36 @@ class OracleInboxHandler:
             or event.entity != self._mapper.mapping.source_entity
         ):
             raise OracleInboxError(
-                "Источник или сущность не поддерживается"
+                "Неподдерживаемый источник или сущность"
             )
 
         if event.operation_code == 2:
-            # DELETE не требует DNS или получения target.
             return PreparedOracleEvent(
                 event=event,
                 resource=None,
             )
 
-        # INSERT / UPDATE:
-        # проверка mapping, адреса, allowlist и DNS.
-        resource = await prepare_oracle_resource(
-            event,
-            self._mapper,
-        )
+        try:
+            resource = await prepare_oracle_resource(
+                event,
+                self._mapper,
+            )
+
+        except FullSnapshotRequired:
+            if event.operation_code != 3:
+                raise
+
+            resource = await self._prepare_partial_update(
+                event
+            )
+
+        except (
+            OraclePreparationError,
+            MissingSourceSequence,
+        ):
+            raise OracleInboxError(
+                "Некорректные поля события"
+            ) from None
 
         return PreparedOracleEvent(
             event=event,
@@ -107,35 +236,62 @@ class OracleInboxHandler:
         claim: InboxClaim,
         prepared: PreparedOracleEvent,
     ) -> None:
-        """Применяет изменения только внутри SQLite."""
+        """Атомарно применяет событие внутри SQLite."""
 
         event = prepared.event
 
         if event.operation_code == 2:
-            apply_oracle_delete(
-                conn,
-                claim,
-                event,
-                expected_source=(
-                    self._mapper.mapping.source_system
-                ),
-                expected_entity=(
-                    self._mapper.mapping.source_entity
-                ),
-            )
+            try:
+                apply_oracle_delete(
+                    conn,
+                    claim,
+                    event,
+                    expected_source=(
+                        self._mapper.mapping.source_system
+                    ),
+                    expected_entity=(
+                        self._mapper.mapping.source_entity
+                    ),
+                )
+
+            except (
+                OracleDeleteError,
+                SourceSequenceConflict,
+                MissingSourceSequence,
+                SourceMappingError,
+            ):
+                raise OracleInboxError(
+                    "Постоянная ошибка DELETE"
+                ) from None
+
             return
 
         if prepared.resource is None:
             raise OracleInboxError(
-                "Не подготовлена конфигурация ресурса"
+                "Отсутствует подготовленный ресурс"
             )
 
-        apply_prepared_oracle_resource(
-            conn,
-            claim,
-            event,
-            prepared.resource,
-            resource_id_prefix=(
-                self._mapper.mapping.resource_id_prefix
-            ),
-        )
+        try:
+            apply_prepared_oracle_resource(
+                conn,
+                claim,
+                event,
+                prepared.resource,
+                resource_id_prefix=(
+                    self._mapper.mapping.resource_id_prefix
+                ),
+            )
+
+        except UnknownSourceResource:
+            # UPDATE мог прийти раньше INSERT.
+            raise
+
+        except (
+            OracleApplyError,
+            SourceMappingError,
+            SourceSequenceConflict,
+            MissingSourceSequence,
+        ):
+            raise OracleInboxError(
+                "Постоянная ошибка INSERT/UPDATE"
+            ) from None

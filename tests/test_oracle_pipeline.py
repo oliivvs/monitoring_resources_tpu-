@@ -411,3 +411,706 @@ async def test_loop_processes_post_automatically(
 
     assert resource_state(engine)["active"] == 1
     assert last_sequence(engine) == 10
+
+
+@pytest.mark.asyncio
+async def test_unsupported_source_failed_immediately(
+    environment,
+):
+    engine, client, bridge = environment
+
+    event_id = str(uuid4())
+
+    payload = {
+        "event_id": event_id,
+        "source": "unsupported-source",
+        "entity": "servers",
+        "record_id": "server-17",
+        "operation_code": 1,
+        "source_sequence": 10,
+        "occurred_at": "2026-11-21T12:00:00Z",
+        "data": full_data(),
+    }
+
+    response = client.post(
+        API_PATH,
+        json=payload,
+        headers={
+            "Authorization": f"Bearer {SYNC_TOKEN}"
+        },
+    )
+
+    assert response.status_code == 202
+
+    result = await process(engine, bridge)
+
+    assert result.disposition == "FAILED"
+
+    saved = event_status(engine, event_id)
+
+    assert saved["processing_status"] == "FAILED"
+    assert saved["attempts"] == 1
+    assert saved["last_error"] == "OracleInboxError"
+    assert last_sequence(engine) is None
+
+
+@pytest.mark.asyncio
+async def test_invalid_resource_fields_failed_immediately(
+    environment,
+):
+    engine, client, bridge = environment
+
+    event_id = send(
+        client,
+        10,
+        data=full_data(active="not-a-boolean"),
+    )
+
+    result = await process(engine, bridge)
+
+    assert result.disposition == "FAILED"
+    assert event_status(engine, event_id)["attempts"] == 1
+    assert event_status(engine, event_id)[
+        "last_error"
+    ] == "OracleInboxError"
+    assert resource_state(engine) is None
+    assert last_sequence(engine) is None
+
+
+@pytest.mark.asyncio
+async def test_sequence_conflict_failed_immediately(
+    environment,
+):
+    engine, client, bridge = environment
+
+    send(client, 10)
+
+    first = await process(engine, bridge)
+    assert first.disposition == "PROCESSED"
+
+    event_id = send(
+        client,
+        10,
+        operation=3,
+        data=full_data(name="Конфликтующая версия"),
+    )
+
+    result = await process(engine, bridge)
+
+    assert result.disposition == "FAILED"
+    assert event_status(engine, event_id)["attempts"] == 1
+    assert event_status(engine, event_id)[
+        "last_error"
+    ] == "OracleInboxError"
+
+    assert last_sequence(engine) == 10
+    assert resource_state(engine)["name"] == "Сервер ТПУ"
+    assert resource_state(engine)["version_number"] == 1
+
+
+@pytest.mark.asyncio
+async def test_unknown_update_still_retries(
+    environment,
+):
+    engine, client, bridge = environment
+
+    event_id = send(
+        client,
+        10,
+        operation=3,
+        data=full_data(),
+    )
+
+    result = await process(engine, bridge)
+
+    assert result.disposition == "RETRY"
+
+    saved = event_status(engine, event_id)
+
+    assert saved["processing_status"] == "PENDING"
+    assert saved["attempts"] == 1
+    assert saved["last_error"] == "UnknownSourceResource"
+
+    assert resource_state(engine) is None
+    assert last_sequence(engine) is None
+
+
+@pytest.mark.asyncio
+async def test_delete_without_sequence_failed_immediately(
+    environment,
+):
+    engine, client, bridge = environment
+
+    event_id = send(
+        client,
+        None,
+        operation=2,
+        data={},
+    )
+
+    result = await process(engine, bridge)
+
+    assert result.disposition == "FAILED"
+
+    saved = event_status(engine, event_id)
+
+    assert saved["processing_status"] == "FAILED"
+    assert saved["attempts"] == 1
+    assert saved["last_error"] == "OracleInboxError"
+
+    assert last_sequence(engine) is None
+    assert resource_state(engine) is None
+
+
+# A23.2.2: частичные UPDATE с Entity API.
+
+def make_snapshot_handler(
+    original_bridge,
+    record=None,
+    *,
+    items=None,
+    status_code=200,
+):
+    import httpx
+
+    from integrations.tpu.entity_client import (
+        EntityRoutes,
+        TpuEntityClient,
+    )
+
+    requests = []
+
+    def mock_response(request):
+        requests.append(request)
+
+        if status_code != 200:
+            return httpx.Response(
+                status_code,
+                json={"error": "test"},
+            )
+
+        records = (
+            items
+            if items is not None
+            else [record]
+        )
+
+        return httpx.Response(
+            200,
+            json={
+                "items": records,
+                "next_cursor": None,
+            },
+        )
+
+    http_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(mock_response)
+    )
+
+    entity_client = TpuEntityClient(
+        base_url="http://127.0.0.1:8001",
+        routes=EntityRoutes.local_mock(),
+        http_client=http_client,
+    )
+
+    bridge = OracleInboxHandler(
+        original_bridge._mapper,
+        snapshot_client=entity_client,
+    )
+
+    return bridge, http_client, requests
+
+
+def make_snapshot_record(sequence=11, **changes):
+    return {
+        **full_data(**changes),
+        "source_record_id": "server-17",
+        "source_sequence": sequence,
+    }
+
+
+@pytest.mark.asyncio
+async def test_partial_update_fetches_full_snapshot(
+    environment,
+):
+    import json
+
+    engine, client, original_bridge = environment
+
+    send(client, 10)
+    await process(engine, original_bridge)
+
+    event_id = send(
+        client,
+        11,
+        operation=3,
+        data={"name": "Новое название"},
+    )
+
+    bridge, http_client, requests = make_snapshot_handler(
+        original_bridge,
+        make_snapshot_record(
+            name="Новое название",
+            interval_seconds=120,
+        ),
+    )
+
+    async with http_client:
+        result = await process(engine, bridge)
+
+    assert result.disposition == "PROCESSED"
+    assert resource_state(engine)["name"] == "Новое название"
+    assert resource_state(engine)["interval_seconds"] == 120
+    assert resource_state(engine)["version_number"] == 2
+    assert last_sequence(engine) == 11
+
+    assert event_status(engine, event_id)[
+        "processing_status"
+    ] == "PROCESSED"
+
+    assert len(requests) == 1
+    assert requests[0].method == "GET"
+    assert requests[0].url.params[
+        "source_record_id"
+    ] == "server-17"
+
+    # Оригинальный JSON события не переписывается.
+    with read_transaction(engine) as conn:
+        raw_payload = conn.execute(
+            text("""
+                SELECT payload_json
+                FROM inbox_events
+                WHERE event_id=:id
+            """),
+            {"id": event_id},
+        ).scalar_one()
+
+    assert json.loads(raw_payload)["data"] == {
+        "name": "Новое название"
+    }
+
+
+@pytest.mark.asyncio
+async def test_snapshot_not_ready_retries(environment):
+    engine, client, original_bridge = environment
+
+    send(client, 10)
+    await process(engine, original_bridge)
+
+    event_id = send(
+        client, 11, operation=3,
+        data={"name": "Новое название"},
+    )
+
+    bridge, http_client, _ = make_snapshot_handler(
+        original_bridge,
+        items=[],
+    )
+
+    async with http_client:
+        result = await process(engine, bridge)
+
+    assert result.disposition == "RETRY"
+    assert last_sequence(engine) == 10
+    assert resource_state(engine)["version_number"] == 1
+    assert event_status(engine, event_id)[
+        "last_error"
+    ] == "OracleSnapshotNotReady"
+
+
+@pytest.mark.asyncio
+async def test_snapshot_wrong_sequence_retries(environment):
+    engine, client, original_bridge = environment
+
+    send(client, 10)
+    await process(engine, original_bridge)
+
+    event_id = send(
+        client, 11, operation=3,
+        data={"name": "Новое название"},
+    )
+
+    bridge, http_client, _ = make_snapshot_handler(
+        original_bridge,
+        make_snapshot_record(
+            sequence=12,
+            name="Новое название",
+        ),
+    )
+
+    async with http_client:
+        result = await process(engine, bridge)
+
+    assert result.disposition == "RETRY"
+    assert last_sequence(engine) == 10
+    assert resource_state(engine)["version_number"] == 1
+    assert event_status(engine, event_id)[
+        "last_error"
+    ] == "OracleSnapshotNotReady"
+
+
+@pytest.mark.asyncio
+async def test_snapshot_wrong_id_fails(environment):
+    engine, client, original_bridge = environment
+
+    event_id = send(
+        client, 11, operation=3,
+        data={"name": "Новое название"},
+    )
+
+    record = make_snapshot_record(
+        name="Новое название"
+    )
+    record["source_record_id"] = "another-server"
+
+    bridge, http_client, _ = make_snapshot_handler(
+        original_bridge,
+        record,
+    )
+
+    async with http_client:
+        result = await process(engine, bridge)
+
+    assert result.disposition == "FAILED"
+    assert event_status(engine, event_id)[
+        "last_error"
+    ] == "OracleInboxError"
+    assert resource_state(engine) is None
+    assert last_sequence(engine) is None
+
+
+@pytest.mark.asyncio
+async def test_snapshot_conflicting_field_fails(environment):
+    engine, client, original_bridge = environment
+
+    send(client, 10)
+    await process(engine, original_bridge)
+
+    event_id = send(
+        client, 11, operation=3,
+        data={"name": "Название из уведомления"},
+    )
+
+    bridge, http_client, _ = make_snapshot_handler(
+        original_bridge,
+        make_snapshot_record(
+            name="Другое название",
+        ),
+    )
+
+    async with http_client:
+        result = await process(engine, bridge)
+
+    assert result.disposition == "FAILED"
+    assert last_sequence(engine) == 10
+    assert resource_state(engine)["name"] == "Сервер ТПУ"
+    assert event_status(engine, event_id)[
+        "last_error"
+    ] == "OracleInboxError"
+
+
+@pytest.mark.asyncio
+async def test_snapshot_duplicate_records_fail(environment):
+    engine, client, original_bridge = environment
+
+    event_id = send(
+        client, 11, operation=3,
+        data={"name": "Новое название"},
+    )
+
+    record = make_snapshot_record(
+        name="Новое название"
+    )
+
+    bridge, http_client, _ = make_snapshot_handler(
+        original_bridge,
+        items=[record, record],
+    )
+
+    async with http_client:
+        result = await process(engine, bridge)
+
+    assert result.disposition == "FAILED"
+    assert event_status(engine, event_id)[
+        "last_error"
+    ] == "OracleInboxError"
+    assert last_sequence(engine) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "http_status,expected",
+    [
+        (401, "FAILED"),
+        (503, "RETRY"),
+    ],
+)
+async def test_snapshot_http_errors(
+    environment,
+    http_status,
+    expected,
+):
+    engine, client, original_bridge = environment
+
+    send(client, 10)
+    await process(engine, original_bridge)
+
+    event_id = send(
+        client, 11, operation=3,
+        data={"name": "Новое название"},
+    )
+
+    bridge, http_client, _ = make_snapshot_handler(
+        original_bridge,
+        status_code=http_status,
+    )
+
+    async with http_client:
+        result = await process(engine, bridge)
+
+    assert result.disposition == expected
+    assert last_sequence(engine) == 10
+    assert resource_state(engine)["version_number"] == 1
+
+    saved = event_status(engine, event_id)
+    assert saved["attempts"] == 1
+    assert saved["processing_status"] == (
+        "FAILED" if expected == "FAILED" else "PENDING"
+    )
+
+
+@pytest.mark.asyncio
+async def test_full_update_skips_snapshot_fetch(environment):
+    engine, client, original_bridge = environment
+
+    send(client, 10)
+    await process(engine, original_bridge)
+
+    send(
+        client,
+        11,
+        operation=3,
+        data=full_data(name="Полное обновление"),
+    )
+
+    bridge, http_client, requests = make_snapshot_handler(
+        original_bridge,
+        make_snapshot_record(),
+    )
+
+    async with http_client:
+        result = await process(engine, bridge)
+
+    assert result.disposition == "PROCESSED"
+    assert resource_state(engine)["name"] == (
+        "Полное обновление"
+    )
+    assert len(requests) == 0
+
+
+@pytest.mark.asyncio
+async def test_delete_skips_snapshot_fetch(environment):
+    engine, client, original_bridge = environment
+
+    send(client, 10)
+    await process(engine, original_bridge)
+
+    send(
+        client, 11, operation=2, data={},
+    )
+
+    bridge, http_client, requests = make_snapshot_handler(
+        original_bridge,
+        make_snapshot_record(),
+    )
+
+    async with http_client:
+        result = await process(engine, bridge)
+
+    assert result.disposition == "PROCESSED"
+    assert resource_state(engine)["active"] == 0
+    assert len(requests) == 0
+
+
+@pytest.mark.asyncio
+async def test_partial_update_recovers_after_entity_api_outage(
+    environment,
+):
+    """Временный сбой API -> RETRY -> успешное обновление."""
+
+    from datetime import timedelta
+
+    engine, client, original_bridge = environment
+
+    # Создаём исходный ресурс.
+    send(client, 10)
+    result = await process(engine, original_bridge)
+
+    assert result.disposition == "PROCESSED"
+    assert resource_state(engine)["version_number"] == 1
+
+    # Отправляем частичный UPDATE.
+    event_id = send(
+        client,
+        11,
+        operation=3,
+        data={"name": "Восстановленный сервер"},
+    )
+
+    # Первая попытка: Entity API недоступен (HTTP 503).
+    broken_bridge, broken_client, _ = make_snapshot_handler(
+        original_bridge,
+        status_code=503,
+    )
+
+    first_now = datetime.now(timezone.utc) + timedelta(
+        seconds=1
+    )
+
+    async with broken_client:
+        first = await process(
+            engine,
+            broken_bridge,
+            now=first_now,
+            retry_base_seconds=5,
+        )
+
+    assert first.disposition == "RETRY"
+
+    saved = event_status(engine, event_id)
+
+    assert saved["processing_status"] == "PENDING"
+    assert saved["attempts"] == 1
+    assert saved["last_error"] == "EntityApiHttpError"
+
+    # Неудачный запрос не изменил конфигурацию.
+    assert resource_state(engine)["version_number"] == 1
+    assert resource_state(engine)["interval_seconds"] == 60
+    assert last_sequence(engine) == 10
+
+    # Вторая попытка: API восстановился.
+    recovered_bridge, recovered_client, requests = (
+        make_snapshot_handler(
+            original_bridge,
+            make_snapshot_record(
+                name="Восстановленный сервер",
+                interval_seconds=180,
+            ),
+        )
+    )
+
+    async with recovered_client:
+        second = await process(
+            engine,
+            recovered_bridge,
+            now=first_now + timedelta(seconds=10),
+            retry_base_seconds=5,
+        )
+
+    assert second.disposition == "PROCESSED"
+
+    saved = event_status(engine, event_id)
+    resource = resource_state(engine)
+
+    assert saved["processing_status"] == "PROCESSED"
+    assert saved["attempts"] == 2
+    assert saved["last_error"] is None
+
+    assert resource["name"] == "Восстановленный сервер"
+    assert resource["version_number"] == 2
+    assert resource["interval_seconds"] == 180
+    assert last_sequence(engine) == 11
+
+    assert len(requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_partial_update_recovers_after_entity_api_outage(
+    environment,
+):
+    """Временный сбой API -> RETRY -> успешное обновление."""
+
+    from datetime import timedelta
+
+    engine, client, original_bridge = environment
+
+    # Создаём исходный ресурс.
+    send(client, 10)
+    result = await process(engine, original_bridge)
+
+    assert result.disposition == "PROCESSED"
+    assert resource_state(engine)["version_number"] == 1
+
+    # Отправляем частичный UPDATE.
+    event_id = send(
+        client,
+        11,
+        operation=3,
+        data={"name": "Восстановленный сервер"},
+    )
+
+    # Первая попытка: Entity API недоступен (HTTP 503).
+    broken_bridge, broken_client, _ = make_snapshot_handler(
+        original_bridge,
+        status_code=503,
+    )
+
+    first_now = datetime.now(timezone.utc) + timedelta(
+        seconds=1
+    )
+
+    async with broken_client:
+        first = await process(
+            engine,
+            broken_bridge,
+            now=first_now,
+            retry_base_seconds=5,
+        )
+
+    assert first.disposition == "RETRY"
+
+    saved = event_status(engine, event_id)
+
+    assert saved["processing_status"] == "PENDING"
+    assert saved["attempts"] == 1
+    assert saved["last_error"] == "EntityApiHttpError"
+
+    # Неудачный запрос не изменил конфигурацию.
+    assert resource_state(engine)["version_number"] == 1
+    assert resource_state(engine)["interval_seconds"] == 60
+    assert last_sequence(engine) == 10
+
+    # Вторая попытка: API восстановился.
+    recovered_bridge, recovered_client, requests = (
+        make_snapshot_handler(
+            original_bridge,
+            make_snapshot_record(
+                name="Восстановленный сервер",
+                interval_seconds=180,
+            ),
+        )
+    )
+
+    async with recovered_client:
+        second = await process(
+            engine,
+            recovered_bridge,
+            now=first_now + timedelta(seconds=10),
+            retry_base_seconds=5,
+        )
+
+    assert second.disposition == "PROCESSED"
+
+    saved = event_status(engine, event_id)
+    resource = resource_state(engine)
+
+    assert saved["processing_status"] == "PROCESSED"
+    assert saved["attempts"] == 2
+    assert saved["last_error"] is None
+
+    assert resource["name"] == "Восстановленный сервер"
+    assert resource["version_number"] == 2
+    assert resource["interval_seconds"] == 180
+    assert last_sequence(engine) == 11
+
+    assert len(requests) == 1

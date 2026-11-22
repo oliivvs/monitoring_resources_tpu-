@@ -15,8 +15,10 @@ import logging
 import signal
 
 from pathlib import Path
+from ipaddress import ip_address
+from urllib.parse import urlsplit
 
-from pydantic import Field
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy import text
 from sqlalchemy.engine import Engine, make_url
@@ -26,6 +28,10 @@ from app.database import get_engine
 from checks.security import NetworkPolicy
 from db.session import read_transaction
 
+from integrations.tpu.entity_client import (
+    EntityRoutes,
+    TpuEntityClient,
+)
 from integrations.tpu.entity_mapper import (
     EntityMapper,
     load_mapping,
@@ -57,6 +63,18 @@ class OracleWorkerSettings(BaseSettings):
 
     allowed_hosts: str = ""
     allowed_ports: str = ""
+
+    # Snapshot API выключен по умолчанию.
+    snapshot_enabled: bool = False
+    snapshot_base_url: str | None = None
+    snapshot_allowed_hosts: str = ""
+    snapshot_token: SecretStr | None = None
+
+    snapshot_timeout_seconds: float = Field(
+        default=10.0,
+        gt=0,
+        le=30,
+    )
 
     poll_seconds: float = Field(
         default=1.0,
@@ -125,6 +143,74 @@ def build_network_policy(
     )
 
 
+def build_snapshot_client(
+    settings: OracleWorkerSettings,
+) -> TpuEntityClient | None:
+    """Создаёт явно разрешённый Snapshot-клиент.
+
+    Пока используется только учебный маршрут Entity API.
+    Промышленный контракт требует отдельного согласования.
+    """
+
+    if not settings.snapshot_enabled:
+        return None
+
+    if not settings.snapshot_base_url:
+        raise ValueError(
+            "Не указан Snapshot Base URL"
+        )
+
+    if (
+        settings.snapshot_token is None
+        or not settings.snapshot_token.get_secret_value().strip()
+    ):
+        raise ValueError(
+            "Не настроен токен Snapshot API"
+        )
+
+    parsed = urlsplit(settings.snapshot_base_url)
+
+    allowed = {
+        host.strip().lower()
+        for host in settings.snapshot_allowed_hosts.split(",")
+        if host.strip()
+    }
+
+    hostname = (
+        parsed.hostname.lower()
+        if parsed.hostname is not None
+        else None
+    )
+
+    if (
+        parsed.scheme != "https"
+        or hostname is None
+        or hostname not in allowed
+        or parsed.port not in (None, 443)
+    ):
+        raise ValueError(
+            "Snapshot API требует HTTPS и разрешённый host"
+        )
+
+    # IP-адреса запрещены в этой конфигурации.
+    # Предполагается явно согласованное DNS-имя API.
+    try:
+        ip_address(hostname)
+    except ValueError:
+        pass
+    else:
+        raise ValueError(
+            "Snapshot API должен использовать DNS-имя"
+        )
+
+    return TpuEntityClient(
+        base_url=settings.snapshot_base_url,
+        routes=EntityRoutes.local_mock(),
+        token=settings.snapshot_token,
+        timeout_seconds=settings.snapshot_timeout_seconds,
+    )
+
+
 def build_worker(
     engine: Engine,
     settings: OracleWorkerSettings,
@@ -146,7 +232,12 @@ def build_worker(
         policy,
     )
 
-    bridge = OracleInboxHandler(mapper)
+    snapshot_client = build_snapshot_client(settings)
+
+    bridge = OracleInboxHandler(
+        mapper,
+        snapshot_client=snapshot_client,
+    )
 
     return InboxLoop(
         engine,

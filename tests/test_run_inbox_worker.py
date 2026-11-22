@@ -141,3 +141,89 @@ async def test_worker_starts_and_stops(engine):
         )
 
     assert task.done()
+
+
+# A23.2.3: настройки клиента полного снимка.
+
+def test_snapshot_disabled_by_default():
+    from scripts.run_inbox_worker import build_snapshot_client
+
+    assert build_snapshot_client(settings()) is None
+
+
+def test_snapshot_requires_url():
+    from scripts.run_inbox_worker import build_snapshot_client
+
+    with pytest.raises(ValueError):
+        build_snapshot_client(
+            settings(snapshot_enabled=True)
+        )
+
+
+def test_snapshot_requires_token():
+    from scripts.run_inbox_worker import build_snapshot_client
+
+    with pytest.raises(ValueError):
+        build_snapshot_client(
+            settings(
+                snapshot_enabled=True,
+                snapshot_base_url="https://entity.example.org",
+                snapshot_allowed_hosts="entity.example.org",
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "http://entity.example.org",
+        "https://other.example.org",
+        "https://entity.example.org:8443",
+        "https://127.0.0.1",
+        "https://entity.example.org/other-path",
+    ],
+)
+def test_snapshot_rejects_unsafe_endpoint(base_url):
+    from scripts.run_inbox_worker import build_snapshot_client
+
+    with pytest.raises(ValueError):
+        build_snapshot_client(
+            settings(
+                snapshot_enabled=True,
+                snapshot_base_url=base_url,
+                snapshot_allowed_hosts="entity.example.org",
+                snapshot_token="test-only-secret",
+            )
+        )
+
+
+def test_snapshot_client_created_for_allowed_https():
+    from scripts.run_inbox_worker import build_snapshot_client
+    from integrations.tpu.entity_client import TpuEntityClient
+
+    client = build_snapshot_client(
+        settings(
+            snapshot_enabled=True,
+            snapshot_base_url="https://entity.example.org",
+            snapshot_allowed_hosts="entity.example.org",
+            snapshot_token="test-only-secret",
+        )
+    )
+
+    assert isinstance(client, TpuEntityClient)
+
+
+def test_worker_receives_snapshot_client(engine):
+    worker = build_worker(
+        engine,
+        settings(
+            snapshot_enabled=True,
+            snapshot_base_url="https://entity.example.org",
+            snapshot_allowed_hosts="entity.example.org",
+            snapshot_token="test-only-secret",
+        ),
+    )
+
+    handler = worker._prepare.__self__
+
+    assert handler._snapshot_client is not None
