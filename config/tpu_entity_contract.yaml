@@ -1,0 +1,12 @@
+# A25.2. Учебный контракт Oracle Entity API.
+# Значения заменить после согласования с ТПУ.
+
+source_entity: servers
+
+records_path: /mock/tpu/entity/v1/entities/{entity_id}/records
+
+identity_field: source_record_id
+sequence_field: source_sequence
+
+response_items_field: items
+response_cursor_field: next_cursor

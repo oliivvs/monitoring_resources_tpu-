@@ -227,3 +227,104 @@ def test_worker_receives_snapshot_client(engine):
     handler = worker._prepare.__self__
 
     assert handler._snapshot_client is not None
+
+
+
+
+
+
+def test_worker_rejects_prepare_timeout_near_lease(engine):
+    with pytest.raises(ValueError, match="lease_seconds"):
+        build_worker(
+            engine,
+            settings(
+                lease_seconds=60,
+                prepare_timeout_seconds=55,
+            ),
+        )
+
+
+def test_worker_rejects_snapshot_timeout_over_prepare(engine):
+    with pytest.raises(ValueError, match="Snapshot API"):
+        build_worker(
+            engine,
+            settings(
+                snapshot_enabled=True,
+                snapshot_base_url="https://entity.example.org",
+                snapshot_allowed_hosts="entity.example.org",
+                snapshot_token="test-only-secret",
+                snapshot_timeout_seconds=20,
+                prepare_timeout_seconds=15,
+            ),
+        )
+
+
+# A25.1: настраиваемый маршрут Oracle Entity API.
+
+def test_snapshot_records_path_defaults_to_mock():
+    from scripts.run_inbox_worker import build_snapshot_client
+
+    client = build_snapshot_client(
+        settings(
+            snapshot_enabled=True,
+            snapshot_base_url="https://entity.example.org",
+            snapshot_allowed_hosts="entity.example.org",
+            snapshot_token="test-only-token",
+        )
+    )
+
+    assert client._routes.records == (
+        "/mock/tpu/entity/v1/entities/{entity_id}/records"
+    )
+
+
+def test_snapshot_records_path_can_be_configured():
+    from scripts.run_inbox_worker import build_snapshot_client
+
+    client = build_snapshot_client(
+        settings(
+            snapshot_enabled=True,
+            snapshot_base_url="https://entity.example.org",
+            snapshot_allowed_hosts="entity.example.org",
+            snapshot_token="test-only-token",
+            snapshot_records_path=(
+                "/api/v1/entities/{entity_id}/records"
+            ),
+        )
+    )
+
+    assert client._routes.records == (
+        "/api/v1/entities/{entity_id}/records"
+    )
+
+
+@pytest.mark.parametrize(
+    "bad_path",
+    [
+        "https://evil.example.org/records/{entity_id}",
+        "//evil.example.org/{entity_id}",
+        "/api/../entities/{entity_id}",
+        "/api/{entity_id}/records?token=secret",
+        "/api/entities/records",
+        "/api/{entity_id}/{entity_id}/records",
+        "/api/%2F/{entity_id}",
+    ],
+)
+def test_snapshot_records_path_rejects_unsafe_values(
+    bad_path,
+):
+    from scripts.run_inbox_worker import build_snapshot_client
+
+    with pytest.raises(
+        ValueError,
+        match="Некорректный маршрут Snapshot API",
+    ):
+        build_snapshot_client(
+            settings(
+                snapshot_enabled=True,
+                snapshot_base_url="https://entity.example.org",
+                snapshot_allowed_hosts="entity.example.org",
+                snapshot_token="test-only-token",
+                snapshot_records_path=bad_path,
+            )
+        )

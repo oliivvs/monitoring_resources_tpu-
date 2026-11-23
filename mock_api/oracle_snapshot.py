@@ -63,6 +63,9 @@ def create_snapshot_app(
         return {"status": "ok"}
 
     @application.get(
+        "/lab/tpu/entity/v2/entities/{entity_id}/records"
+    )
+    @application.get(
         "/mock/tpu/entity/v1/entities/{entity_id}/records"
     )
     def get_records(
