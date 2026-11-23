@@ -257,3 +257,74 @@ def test_worker_rejects_snapshot_timeout_over_prepare(engine):
                 prepare_timeout_seconds=15,
             ),
         )
+
+
+# A25.1: настраиваемый маршрут Oracle Entity API.
+
+def test_snapshot_records_path_defaults_to_mock():
+    from scripts.run_inbox_worker import build_snapshot_client
+
+    client = build_snapshot_client(
+        settings(
+            snapshot_enabled=True,
+            snapshot_base_url="https://entity.example.org",
+            snapshot_allowed_hosts="entity.example.org",
+            snapshot_token="test-only-token",
+        )
+    )
+
+    assert client._routes.records == (
+        "/mock/tpu/entity/v1/entities/{entity_id}/records"
+    )
+
+
+def test_snapshot_records_path_can_be_configured():
+    from scripts.run_inbox_worker import build_snapshot_client
+
+    client = build_snapshot_client(
+        settings(
+            snapshot_enabled=True,
+            snapshot_base_url="https://entity.example.org",
+            snapshot_allowed_hosts="entity.example.org",
+            snapshot_token="test-only-token",
+            snapshot_records_path=(
+                "/api/v1/entities/{entity_id}/records"
+            ),
+        )
+    )
+
+    assert client._routes.records == (
+        "/api/v1/entities/{entity_id}/records"
+    )
+
+
+@pytest.mark.parametrize(
+    "bad_path",
+    [
+        "https://evil.example.org/records/{entity_id}",
+        "//evil.example.org/{entity_id}",
+        "/api/../entities/{entity_id}",
+        "/api/{entity_id}/records?token=secret",
+        "/api/entities/records",
+        "/api/{entity_id}/{entity_id}/records",
+        "/api/%2F/{entity_id}",
+    ],
+)
+def test_snapshot_records_path_rejects_unsafe_values(
+    bad_path,
+):
+    from scripts.run_inbox_worker import build_snapshot_client
+
+    with pytest.raises(
+        ValueError,
+        match="Некорректный маршрут Snapshot API",
+    ):
+        build_snapshot_client(
+            settings(
+                snapshot_enabled=True,
+                snapshot_base_url="https://entity.example.org",
+                snapshot_allowed_hosts="entity.example.org",
+                snapshot_token="test-only-token",
+                snapshot_records_path=bad_path,
+            )
+        )
