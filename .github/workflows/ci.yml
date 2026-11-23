@@ -1,0 +1,141 @@
+
+name: TPU Monitoring CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  validation:
+    name: Python, SQLite and Docker configuration
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Check Python syntax
+        run: |
+          python -m compileall -q \
+            app checks db integrations migrations \
+            mock_api mock_entity_api scripts services shared tests
+
+      - name: Run all pytest tests
+        run: |
+          mkdir -p test_reports
+          python -m pytest -q \
+            --junitxml=test_reports/pytest.xml
+
+      - name: Run local HTTP and Outbox smoke test
+        run: python -m scripts.local_smoke
+
+      - name: Run Oracle Sync API demo
+        run: python -m scripts.demo_artemiy
+
+      - name: Run HEARTBEAT end-to-end test
+        run: python -m scripts.heartbeat_e2e
+
+      - name: Verify Alembic migrations on temporary SQLite
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TMP_DIR="$(mktemp -d)"
+          trap 'rm -rf "$TMP_DIR"' EXIT
+
+          export MONITORING_DATABASE_URL="sqlite:///$TMP_DIR/test.sqlite"
+
+          python -m alembic upgrade head
+          python -m alembic current
+
+          python - <<'PY'
+          import os
+          import sqlite3
+
+          path = os.environ[
+              "MONITORING_DATABASE_URL"
+          ].removeprefix("sqlite:///")
+
+          required = {
+              "resources",
+              "resource_config_versions",
+              "http_expected_ranges",
+              "resource_states",
+              "check_results",
+              "status_transitions",
+              "outbox_events",
+              "delivery_attempts",
+              "inbox_events",
+              "resource_source_mappings",
+              "resource_source_sequences",
+          }
+
+          conn = sqlite3.connect(path)
+
+          try:
+              tables = {
+                  row[0]
+                  for row in conn.execute(
+                      "SELECT name FROM sqlite_master "
+                      "WHERE type='table'"
+                  )
+              }
+
+              missing = required - tables
+              assert not missing, missing
+
+              revision = conn.execute(
+                  "SELECT version_num FROM alembic_version"
+              ).fetchone()[0]
+
+              assert revision == "005_source_sequence"
+
+              assert conn.execute(
+                  "PRAGMA integrity_check"
+              ).fetchone()[0] == "ok"
+
+              assert not conn.execute(
+                  "PRAGMA foreign_key_check"
+              ).fetchall()
+
+              print("PASS: SQLite migrations 001-005")
+
+          finally:
+              conn.close()
+          PY
+
+      - name: Validate combined Docker Compose
+        env:
+          MONITORING_EVENT_TOKEN: ci-local-test-token
+        run: |
+          docker compose \
+            -f compose.yaml \
+            -f compose.heartbeat.yaml \
+            config --quiet
+
+      - name: Upload test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-results
+          path: test_reports/pytest.xml
+          if-no-files-found: ignore
