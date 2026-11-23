@@ -9,11 +9,14 @@ from __future__ import annotations
 
 import json
 import re
+import ssl
 from dataclasses import dataclass
 from urllib.parse import urlsplit
 
 import httpx
 from pydantic import SecretStr, ValidationError
+
+from integrations.tpu.snapshot_transport import PinnedSnapshotTransport
 
 from integrations.tpu.entity_models import (
     EntitiesResponse,
@@ -104,6 +107,7 @@ class TpuEntityClient:
         timeout_seconds: float = 10.0,
         http_client: httpx.AsyncClient | None = None,
         max_response_bytes: int = 512 * 1024,
+        pinned_allowed_cidrs: tuple[str, ...] | None = None,
     ) -> None:
 
         url = urlsplit(base_url)
@@ -152,6 +156,7 @@ class TpuEntityClient:
         self._timeout = timeout_seconds
         self._http_client = http_client
         self._max_response_bytes = max_response_bytes
+        self._pinned_allowed_cidrs = pinned_allowed_cidrs
 
     @staticmethod
     def _valid_entity_id(entity_id: str) -> str:
@@ -251,9 +256,26 @@ class TpuEntityClient:
                 params=params,
             )
 
+        # Используем системные доверенные CA, но не
+        # наследуем HTTP_PROXY/HTTPS_PROXY/ALL_PROXY.
+        # ssl.create_default_context() также учитывает
+        # стандартные OpenSSL-пути сертификатов.
+        context = ssl.create_default_context()
+        extra = {}
+
+        if self._pinned_allowed_cidrs is not None:
+            extra["transport"] = PinnedSnapshotTransport(
+                expected_host=httpx.URL(self._base_url).host,
+                allowed_cidrs=self._pinned_allowed_cidrs,
+                ssl_context=context,
+            )
+
         async with httpx.AsyncClient(
             timeout=self._timeout,
             follow_redirects=False,
+            trust_env=False,
+            verify=context,
+            **extra,
         ) as client:
             return await self._get_using(
                 client,

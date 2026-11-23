@@ -227,3 +227,33 @@ def test_worker_receives_snapshot_client(engine):
     handler = worker._prepare.__self__
 
     assert handler._snapshot_client is not None
+
+
+
+
+
+
+def test_worker_rejects_prepare_timeout_near_lease(engine):
+    with pytest.raises(ValueError, match="lease_seconds"):
+        build_worker(
+            engine,
+            settings(
+                lease_seconds=60,
+                prepare_timeout_seconds=55,
+            ),
+        )
+
+
+def test_worker_rejects_snapshot_timeout_over_prepare(engine):
+    with pytest.raises(ValueError, match="Snapshot API"):
+        build_worker(
+            engine,
+            settings(
+                snapshot_enabled=True,
+                snapshot_base_url="https://entity.example.org",
+                snapshot_allowed_hosts="entity.example.org",
+                snapshot_token="test-only-secret",
+                snapshot_timeout_seconds=20,
+                prepare_timeout_seconds=15,
+            ),
+        )

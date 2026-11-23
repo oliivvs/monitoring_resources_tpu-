@@ -1114,3 +1114,224 @@ async def test_partial_update_recovers_after_entity_api_outage(
     assert last_sequence(engine) == 11
 
     assert len(requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_partial_update_timeout_then_recovers(environment):
+    """Таймаут подготовки не изменяет ресурс."""
+
+    from datetime import timedelta
+
+    import httpx
+
+    from integrations.tpu.entity_client import (
+        EntityRoutes,
+        TpuEntityClient,
+    )
+
+    engine, client, original_bridge = environment
+
+    send(client, 10)
+    initial = await process(engine, original_bridge)
+
+    assert initial.disposition == "PROCESSED"
+
+    event_id = send(
+        client,
+        11,
+        operation=3,
+        data={"name": "После таймаута"},
+    )
+
+    async def slow_response(request):
+        await asyncio.sleep(0.2)
+        return httpx.Response(
+            200,
+            json={
+                "items": [
+                    make_snapshot_record(
+                        name="После таймаута",
+                        interval_seconds=180,
+                    )
+                ],
+                "next_cursor": None,
+            },
+        )
+
+    http_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(slow_response)
+    )
+
+    entity_client = TpuEntityClient(
+        base_url="http://127.0.0.1:8001",
+        routes=EntityRoutes.local_mock(),
+        http_client=http_client,
+    )
+
+    timed_bridge = OracleInboxHandler(
+        original_bridge._mapper,
+        snapshot_client=entity_client,
+        prepare_timeout_seconds=0.02,
+    )
+
+    first_now = (
+        datetime.now(timezone.utc)
+        + timedelta(seconds=1)
+    )
+
+    async with http_client:
+        first = await process(
+            engine,
+            timed_bridge,
+            now=first_now,
+        )
+
+    assert first.disposition == "RETRY"
+
+    saved = event_status(engine, event_id)
+
+    assert saved["processing_status"] == "PENDING"
+    assert saved["last_error"] == "TimeoutError"
+    assert saved["attempts"] == 1
+
+    assert resource_state(engine)["version_number"] == 1
+    assert resource_state(engine)["interval_seconds"] == 60
+    assert last_sequence(engine) == 10
+
+    recovered_bridge, recovered_client, _ = (
+        make_snapshot_handler(
+            original_bridge,
+            make_snapshot_record(
+                name="После таймаута",
+                interval_seconds=180,
+            ),
+        )
+    )
+
+    async with recovered_client:
+        second = await process(
+            engine,
+            recovered_bridge,
+            now=first_now + timedelta(seconds=10),
+        )
+
+    assert second.disposition == "PROCESSED"
+
+    saved = event_status(engine, event_id)
+    resource = resource_state(engine)
+
+    assert saved["processing_status"] == "PROCESSED"
+    assert saved["attempts"] == 2
+    assert saved["last_error"] is None
+
+    assert resource["name"] == "После таймаута"
+    assert resource["version_number"] == 2
+    assert resource["interval_seconds"] == 180
+    assert last_sequence(engine) == 11
+
+
+@pytest.mark.asyncio
+async def test_inbox_loop_stop_finishes_current_event(environment):
+    """Штатная остановка не обрывает активную обработку."""
+
+    engine, client, bridge = environment
+
+    event_id = send(client, 10)
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def paused_prepare(claim):
+        started.set()
+        await release.wait()
+        return await bridge.prepare(claim)
+
+    worker = InboxLoop(
+        engine,
+        prepare=paused_prepare,
+        apply=bridge.apply,
+        poll_seconds=0.01,
+    )
+
+    task = asyncio.create_task(worker.run())
+
+    try:
+        await asyncio.wait_for(started.wait(), timeout=3)
+
+        worker.stop()
+
+        assert not task.done()
+
+    finally:
+        release.set()
+        await asyncio.wait_for(task, timeout=3)
+
+    saved = event_status(engine, event_id)
+
+    assert saved["processing_status"] == "PROCESSED"
+    assert saved["attempts"] == 1
+    assert resource_state(engine)["version_number"] == 1
+    assert last_sequence(engine) == 10
+
+
+@pytest.mark.asyncio
+async def test_async_inbox_exhausts_retries_without_changes(
+    environment,
+):
+    """После последней попытки событие получает FAILED."""
+
+    from datetime import timedelta
+
+    engine, client, bridge = environment
+
+    send(client, 10)
+
+    initial = await process(engine, bridge)
+    assert initial.disposition == "PROCESSED"
+
+    event_id = send(
+        client,
+        11,
+        operation=3,
+        data={"name": "Неполный UPDATE"},
+    )
+
+    now = datetime.now(timezone.utc) + timedelta(seconds=1)
+
+    first = await process(
+        engine,
+        bridge,
+        now=now,
+        max_attempts=2,
+        retry_base_seconds=5,
+    )
+
+    assert first.disposition == "RETRY"
+    assert event_status(engine, event_id)["attempts"] == 1
+
+    second = await process(
+        engine,
+        bridge,
+        now=now + timedelta(seconds=5),
+        max_attempts=2,
+        retry_base_seconds=5,
+    )
+
+    assert second.disposition == "FAILED"
+
+    saved = event_status(engine, event_id)
+
+    assert saved["processing_status"] == "FAILED"
+    assert saved["attempts"] == 2
+    assert saved["last_error"] == "FullSnapshotRequired"
+
+    assert resource_state(engine)["version_number"] == 1
+    assert resource_state(engine)["name"] == "Сервер ТПУ"
+    assert last_sequence(engine) == 10
+
+    assert await process(
+        engine,
+        bridge,
+        now=now + timedelta(days=1),
+        max_attempts=2,
+    ) is None

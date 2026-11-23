@@ -15,7 +15,7 @@ import logging
 import signal
 
 from pathlib import Path
-from ipaddress import ip_address
+from ipaddress import ip_address, ip_network
 from urllib.parse import urlsplit
 
 from pydantic import Field, SecretStr
@@ -68,6 +68,7 @@ class OracleWorkerSettings(BaseSettings):
     snapshot_enabled: bool = False
     snapshot_base_url: str | None = None
     snapshot_allowed_hosts: str = ""
+    snapshot_allowed_cidrs: str = ""
     snapshot_token: SecretStr | None = None
 
     snapshot_timeout_seconds: float = Field(
@@ -86,6 +87,12 @@ class OracleWorkerSettings(BaseSettings):
         default=60,
         ge=1,
         le=3600,
+    )
+
+    prepare_timeout_seconds: float = Field(
+        default=30.0,
+        gt=0,
+        le=120,
     )
 
     max_attempts: int = Field(
@@ -203,12 +210,47 @@ def build_snapshot_client(
             "Snapshot API должен использовать DNS-имя"
         )
 
+    cidrs = tuple(
+        value.strip()
+        for value in settings.snapshot_allowed_cidrs.split(",")
+        if value.strip()
+    )
+
+    for cidr in cidrs:
+        ip_network(cidr, strict=True)
+
     return TpuEntityClient(
         base_url=settings.snapshot_base_url,
         routes=EntityRoutes.local_mock(),
         token=settings.snapshot_token,
         timeout_seconds=settings.snapshot_timeout_seconds,
+        pinned_allowed_cidrs=cidrs,
     )
+
+
+def validate_worker_timing(
+    settings: OracleWorkerSettings,
+) -> None:
+    """Проверяет соотношение таймаутов и lease."""
+
+    if (
+        settings.prepare_timeout_seconds + 10
+        > settings.lease_seconds
+    ):
+        raise ValueError(
+            "lease_seconds должен оставлять минимум "
+            "10 секунд после подготовки"
+        )
+
+    if (
+        settings.snapshot_enabled
+        and settings.snapshot_timeout_seconds
+        >= settings.prepare_timeout_seconds
+    ):
+        raise ValueError(
+            "Таймаут Snapshot API должен быть меньше "
+            "таймаута подготовки"
+        )
 
 
 def build_worker(
@@ -222,6 +264,8 @@ def build_worker(
             "Oracle Worker выключен. "
             "Установите MONITORING_ORACLE_ENABLED=true"
         )
+
+    validate_worker_timing(settings)
 
     mapping = load_mapping(settings.mapping_path)
 
@@ -237,6 +281,7 @@ def build_worker(
     bridge = OracleInboxHandler(
         mapper,
         snapshot_client=snapshot_client,
+        prepare_timeout_seconds=settings.prepare_timeout_seconds,
     )
 
     return InboxLoop(

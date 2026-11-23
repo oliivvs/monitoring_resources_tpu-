@@ -12,6 +12,8 @@ apply():
 
 from __future__ import annotations
 
+import asyncio
+import math
 from dataclasses import dataclass
 
 from pydantic import ValidationError
@@ -78,9 +80,20 @@ class OracleInboxHandler:
         mapper: EntityMapper,
         *,
         snapshot_client: TpuEntityClient | None = None,
+        prepare_timeout_seconds: float | None = None,
     ) -> None:
+        if prepare_timeout_seconds is not None:
+            if (
+                isinstance(prepare_timeout_seconds, bool)
+                or not isinstance(prepare_timeout_seconds, (int, float))
+                or not math.isfinite(prepare_timeout_seconds)
+                or not 0 < prepare_timeout_seconds <= 120
+            ):
+                raise ValueError("Некорректный таймаут подготовки")
+
         self._mapper = mapper
         self._snapshot_client = snapshot_client
+        self._prepare_timeout_seconds = prepare_timeout_seconds
 
     async def _prepare_partial_update(
         self,
@@ -160,6 +173,18 @@ class OracleInboxHandler:
             ) from None
 
     async def prepare(
+        self,
+        claim: InboxClaim,
+    ) -> PreparedOracleEvent:
+        """Подготавливает событие с ограничением времени."""
+
+        if self._prepare_timeout_seconds is None:
+            return await self._prepare_unbounded(claim)
+
+        async with asyncio.timeout(self._prepare_timeout_seconds):
+            return await self._prepare_unbounded(claim)
+
+    async def _prepare_unbounded(
         self,
         claim: InboxClaim,
     ) -> PreparedOracleEvent:
