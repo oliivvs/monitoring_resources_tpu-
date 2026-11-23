@@ -1,0 +1,36 @@
+
+# N25: дополнительный HEARTBEAT-worker.
+# Запускать вместе с основным Compose-файлом:
+# docker compose -f compose.yaml -f compose.heartbeat.yaml up -d
+
+services:
+  heartbeat:
+    build: .
+    image: tpu-monitoring:a08
+    init: true
+
+    command:
+      - python
+      - -m
+      - scripts.run_heartbeat_worker
+      - --database
+      - /data/monitoring.db
+      - --loop
+      - --poll-seconds
+      - "10"
+
+    environment:
+      MONITORING_DATABASE_URL: sqlite:////data/monitoring.db
+
+    volumes:
+      - monitoring-data:/data
+
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+    restart: unless-stopped
+    stop_grace_period: 15s
+
+volumes:
+  monitoring-data:
